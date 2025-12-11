@@ -1,0 +1,117 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Train BEVDiffDepth (debug single-process)",
+            "type": "debugpy",
+            "request": "launch",
+            // "module": "bevdepth.exps.base_cli",
+            "program": "${workspaceFolder}/BEVDepth/bevdepth/exps/nuscenes/mv/bev_depth_lss_r50_480x800_128x128_24e_2key_dino.py",
+            "cwd": "${workspaceFolder}/BEVDepth",
+            "console": "integratedTerminal",
+            "args": [
+                "--amp_backend", "native",
+                // "-e",
+                "-b", "1",
+                "--gpus", "1"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/BEVDepth",
+                "CUDA_VISIBLE_DEVICES": "2",
+
+            },
+        },
+
+        {
+            "name": "Train_bevdiffuser", 
+            "type": "debugpy",
+            "request": "launch",
+            //"module": "torch.distributed.launch",
+            //"justMyCode": true,
+            "program": "${workspaceFolder}/BEVDepth/bevdepth/projects/train_bev_diffuser_dino_v2.py",
+            // "program": "${workspaceFolder}/BEVFormer/projects/bevdiffuser/train_bev_diffuser_original.py",
+            "console": "integratedTerminal",
+            "args": [
+        
+                "--bev_config", "${workspaceFolder}/BEVDepth/bevdepth/projects/configs/bevdiffuser/dinobevdepth.py",
+                // "--bev_config", "${workspaceFolder}/BEVFormer/projects/configs/bevdiffuser/layout_tiny.py", 
+                // "--bev_checkpoint", "${workspaceFolder}/BEVFormer/ckpts/bevformer_tiny_epoch_24.pth",
+                "--pretrained_unet_checkpoint", "None",
+                "--pretrained_model_name_or_path", "stabilityai/stable-diffusion-2-1",
+                "--train_batch_size", "1",
+                "--dataloader_num_workers", "4",
+                "--gradient_accumulation_steps", "1",
+                "--max_train_steps", "10",
+                "--learning_rate", "1e-4",
+                "--lr_scheduler", "constant",
+                "--output_dir", "${workspaceFolder}/train/debug_output",
+                "--checkpoints_total_limit", "1",
+                "--checkpointing_steps", "5",
+                "--tracker_run_name", "debug_run",
+                "--tracker_project_name", "debug_project",
+                "--uncond_prob", "0.2",
+                "--prediction_type", "sample",
+                "--task_loss_scale", "0.1",
+                "--launcher", "none",
+                // "--depth_save_dir", "${workspaceFolder}/BEVFormer/projects/depth_map"
+                // "--task_loss_switch_step", "None"
+                // "--freeze_bev_model"
+                // "--report_to", "none"
+                
+            ],
+
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1",
+                "RANK": "0",
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": "1",
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": "29500",
+                "TORCH_DISTRIBUTED_DEBUG ": "DETAIL"
+
+            }
+        },
+
+        {
+            "name": "Extract DINOv2 features (PCA)",
+            "type": "debugpy",
+            "request": "launch",
+            // "module": "bevdepth.exps.base_cli",
+            "program": "${workspaceFolder}/BEVDepth/bevdepth/projects/fit_pca.py",
+            "cwd": "${workspaceFolder}/BEVDepth",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/BEVDepth",
+                "CUDA_VISIBLE_DEVICES": "0",
+
+            },
+            "justMyCode": false,
+            "subProcess": true
+        },
+
+
+        {
+            "name": "Train BEVDepth (debug single-process)",
+            "type": "debugpy",
+            "request": "launch",
+            // "module": "bevdepth.exps.base_cli",
+            "program": "${workspaceFolder}/BEVDepth/bevdepth/exps/nuscenes/mv/bev_depth_lss_r50_256x704_128x128_24e_2key.py",
+            "cwd": "${workspaceFolder}/BEVDepth",
+            "console": "integratedTerminal",
+            "args": [
+                "--amp_backend", "native",
+                "-b", "1",
+                "--gpus", "1"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/BEVDepth",
+                "CUDA_VISIBLE_DEVICES": "0",
+
+            },
+            "justMyCode": false,
+            "subProcess": true
+        }
+    ]
+}
