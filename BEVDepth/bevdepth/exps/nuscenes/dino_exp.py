@@ -22,7 +22,8 @@ from bevdepth.utils.torch_dist import all_gather_object, get_rank, synchronize
 H = 900
 W = 1600
 # final_dim = (480, 900)
-final_dim = (490, 812)
+# final_dim = (490, 812)
+final_dim = (448, 798)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
                 to_rgb=True)

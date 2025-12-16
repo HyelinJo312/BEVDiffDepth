@@ -245,8 +245,9 @@ class GetDINOV2Feat(nn.Module):
         if not isinstance(images, torch.Tensor):
             raise TypeError("images must be a torch.Tensor")
         
-        B, N, V, C, H, W = images.shape
-        x = images.reshape(B * N * V, C, H, W).contiguous()
+        B, V, C, H, W = images.shape
+        # TODO: sweep img가 들어오면 Key frame과 나머지 구분하도록 코드 수정 필요
+        x = images.reshape(B * V, C, H, W).contiguous()
     
         # aspect ratio 
         x, Hp, Wp, extra_geom = self.image_preprocess(x)  # x: (B*V, 3, H2, W2)

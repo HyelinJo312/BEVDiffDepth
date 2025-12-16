@@ -65,6 +65,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+data/
+pca_ckpts/
+train/
+outputs/
 develop-eggs/
 dist/
 downloads/

@@ -565,6 +565,7 @@ class NuscDetDataset(Dataset):
             box_type_3d=LiDARInstance3DBoxes,
             ego2global_translation=ego2global_translation,
             ego2global_rotation=ego2global_rotation,
+            filename=[key_info[cam]['filename'] for cam in cams],
         )
         
         if lidar_infos is not None:

@@ -26,13 +26,11 @@ import numpy as np
 import torch
 torch.backends.cudnn.enabled = False
 import torch.nn.functional as F
-import torch.utils.data
 import torch.utils.checkpoint
 import transformers
 import diffusers
 import importlib
-from functools import partial
-from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel
+
 from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -51,18 +49,15 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,save_checkpoi
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))+"/..")
-# from projects.mmdet3d_plugin.datasets.builder import build_dataloader
-from bevdepth.datasets.nusc_det_dataset import NuscDetDataset, collate_fn
+from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet.apis import set_random_seed
 
-from bevdepth.projects.layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
-from bevdepth.projects.ldm.modules.diffusionmodules.openaimodel import UNetModel
-from bevdepth.projects.scheduler_utils import DDIMGuidedScheduler
-from bevdepth.projects.model_utils import get_bev_model, build_unet, instantiate_from_config, get_bevdepth_model
-from bevdepth.projects.test_bev_diffuser_dino_v2 import evaluate
+from layout_diffusion.layout_dino_diffusion_unet_v2 import LayoutDiffusionUNetModel
+from scheduler_utils import DDIMGuidedScheduler
+from model_utils import get_bev_model, build_unet, instantiate_from_config
+from test_bev_diffuser_dino import evaluate
 from torch.utils.tensorboard import SummaryWriter
-from bevdepth.projects.fm_feature import GetDINOv2Cond, GetDINOV2Feat
-from bevdepth.evaluators.det_evaluators import DetNuscEvaluator
+from bevdepth.projects.fm_feature import GetDINOv2Cond
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -130,40 +125,33 @@ def train():
         noise_scheduler.register_to_config(prediction_type=args.prediction_type)
         DDIM_scheduler.register_to_config(prediction_type=args.prediction_type)
         
-    # bev_model = get_bev_model(args)
-    bev_model = get_bevdepth_model(args)
-    
+    bev_model = get_bev_model(args)
+
     # Freeze vae and text_encoder
     bev_model.requires_grad_(False)
     if args.task_loss_scale != 0:
-        bev_model.head.requires_grad_(True)
-        # for name, param in bev_model.named_parameters():
-        #     print(f"{name:60s}  requires_grad={param.requires_grad}")
-        #     print("==================================\n")
+        bev_model.module.pts_bbox_head.transformer.decoder.requires_grad_(True)
+        bev_model.module.pts_bbox_head.transformer.reference_points.requires_grad_(True)
+        bev_model.module.pts_bbox_head.cls_branches.requires_grad_(True)
+        bev_model.module.pts_bbox_head.reg_branches.requires_grad_(True)
     
-
-    
-    def get_task_loss(x, sweep_imgs, lidar_depth, mats, img_metas):
-        x = x.unsqueeze(0)
-        base_model = bev_model
-        if isinstance(bev_model, (DDP, DataParallel)):
-            base_model = bev_model.module
-        preds = base_model(sweep_imgs, lidar_depth, mats, img_metas, given_bev=x)
-        targets = base_model.get_targets(gt_boxes, gt_labels)
-        loss = base_model.loss(targets, preds) # detection loss
+    def get_task_loss(x, **kwargs):
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.reshape(-1, bev_cfg.bev_h_*bev_cfg.bev_w_, bev_cfg._dim_)
+        losses = bev_model(return_loss=True, given_bev=x, **kwargs)
+        loss, _ = bev_model.module._parse_losses(losses)
         return loss
-
-    unet = instantiate_from_config(bev_cfg.unet)
+    
+    unet = build_unet(bev_cfg.unet)
     if args.pretrained_unet_checkpoint is not None and (os.path.isfile(args.pretrained_unet_checkpoint) or os.path.isdir(args.pretrained_unet_checkpoint)):
         unet.from_pretrained(args.pretrained_unet_checkpoint, subfolder="unet")
         # train only the downsample and upsample layers
         unet.requires_grad_(False)
         unet.downsample_blocks.requires_grad_(True)
         unet.upsample_blocks.requires_grad_(True)
-        
+
     # Get DINOv2 feature extractor
-    get_dino = GetDINOV2Feat() # 향후 num_sweeps >= 2일때로 확장 필요
-    # get_depth = LoadDepth()
+    get_dino = GetDINOv2Cond()
 
     assert version.parse(accelerate.__version__) >= version.parse("0.16.0"), "accelerate 0.16.0 or above is required"
 
@@ -211,53 +199,74 @@ def train():
     )
     
     with accelerator.main_process_first():
-        train_dataset = NuscDetDataset(ida_aug_conf=bev_cfg.ida_aug_conf,
-                                bda_aug_conf=bev_cfg.bda_aug_conf,
-                                classes=bev_cfg.CLASSES,
-                                data_root=bev_cfg.data_root,
-                                info_paths=bev_cfg.train_info_paths,
-                                is_train=True,
-                                use_cbgs=bev_cfg.data_use_cbgs,
-                                img_conf=bev_cfg.img_conf,
-                                num_sweeps=bev_cfg.num_sweeps,
-                                sweep_idxes=list(),
-                                key_idxes=list(),
-                                return_depth=bev_cfg.data_return_depth,
-                                use_fusion=bev_cfg.use_fusion)
-
-        val_dataset = NuscDetDataset(ida_aug_conf=bev_cfg.ida_aug_conf,
-                                bda_aug_conf=bev_cfg.bda_aug_conf,
-                                classes=bev_cfg.CLASSES,
-                                data_root=bev_cfg.data_root,
-                                info_paths=bev_cfg.val_info_paths,
-                                is_train=False,
-                                img_conf=bev_cfg.img_conf,
-                                num_sweeps=bev_cfg.num_sweeps,
-                                sweep_idxes=list(),
-                                key_idxes=list(),
-                                return_depth=bev_cfg.data_return_depth,
-                                use_fusion=bev_cfg.use_fusion)
-
-    train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.train_batch_size,
-            num_workers=4,
-            drop_last=True,
-            shuffle=False,
-            collate_fn=partial(collate_fn,
-                               is_return_depth=bev_cfg.data_return_depth
-                               or bev_cfg.use_fusion),
-            sampler=None,
-        )
-    
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=False,
-        collate_fn=partial(collate_fn, is_return_depth=bev_cfg.use_fusion),
-        num_workers=4,
-        sampler=None,
+        train_dataset = build_dataset(bev_cfg.data.train, 
+                                      default_args={
+                                          'pc_range': bev_cfg.point_cloud_range,
+                                          'use_3d_bbox': bev_cfg.use_3d_bbox,
+                                          'num_classes': bev_cfg.num_classes,
+                                          'num_bboxes': bev_cfg.num_bboxes,
+                                      })
+        
+        bev_cfg.data.test.load_annos = True
+        val_dataset = build_dataset(bev_cfg.data.test,
+                                    default_args={
+                                        'pc_range': bev_cfg.point_cloud_range,
+                                        'use_3d_bbox': bev_cfg.use_3d_bbox,
+                                        'num_classes': bev_cfg.num_classes,
+                                        'num_bboxes': bev_cfg.num_bboxes,
+                                    })
+        
+      
+    # DataLoaders creation:
+    train_dataloader = build_dataloader(
+        train_dataset,
+        samples_per_gpu=args.train_batch_size, 
+        workers_per_gpu=args.dataloader_num_workers,
+        num_gpus=get_dist_info()[1],
+        dist=(args.launcher != 'none'),
+        seed=args.seed,
+        shuffler_sampler=bev_cfg.data.shuffler_sampler,
+        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
     )
+    
+    val_dataloader = build_dataloader(
+        val_dataset,
+        samples_per_gpu=bev_cfg.data.samples_per_gpu,
+        workers_per_gpu=bev_cfg.data.workers_per_gpu,
+        dist=(args.launcher != 'none'),
+        shuffle=False,
+        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
+    )
+    
+    def get_condition(batch):
+        cond = {}
+        
+        if 'layout_obj_classes' in batch:
+            cond['obj_class'] = torch.stack(batch['layout_obj_classes'].data[0])
+        if 'layout_obj_bboxes' in batch:
+            cond['obj_bbox'] = torch.stack(batch['layout_obj_bboxes'].data[0])
+        if 'layout_obj_is_valid' in batch:
+            cond['is_valid_obj'] = torch.stack(batch['layout_obj_is_valid'].data[0]) 
+        if 'layout_obj_names' in batch:
+            cond['obj_name'] = torch.stack(batch['layout_obj_names'].data[0])
+        
+        if np.random.rand() < args.uncond_prob:
+            if isinstance(unet.module, LayoutDiffusionUNetModel):
+                if 'obj_class' in unet.module.layout_encoder.used_condition_types:
+                    cond['obj_class'] = torch.ones_like(cond['obj_class']).fill_(unet.module.layout_encoder.num_classes_for_layout_object - 1)
+                    cond['obj_class'][:, 0] = unet.module.layout_encoder.num_classes_for_layout_object - 2
+                if 'obj_name' in unet.module.layout_encoder.used_condition_types:
+                    cond['obj_name'] = torch.stack(batch['default_obj_names'].data[0])
+                if 'obj_bbox' in unet.module.layout_encoder.used_condition_types:
+                    cond['obj_bbox'] = torch.zeros_like(cond['obj_bbox'])
+                    if unet.module.layout_encoder.use_3d_bbox:
+                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 0, 1, 1, 1, 0, 0, 0])
+                    else:
+                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 1, 1])
+                cond['is_valid_obj'] = torch.zeros_like(cond['is_valid_obj'])
+                cond['is_valid_obj'][:, 0] = 1.0  
+                 
+        return cond
 
     def get_dino_cond(dino_out):
         if np.random.rand() < args.uncond_prob:
@@ -287,7 +296,7 @@ def train():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
+    
     tb_writer = None
     
     # We need to initialize the trackers we use, and also store our configuration.
@@ -335,13 +344,12 @@ def train():
     global_step = 0
     first_epoch = 0
     step_cnt = 0
-    step_threshold = args.enable_task_loss
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         resume_path = args.resume_from_checkpoint
 
-        accelerator.logger.info(f"Resuming from checkpoint {resume_path}")
+        logger.info(f"Resuming from checkpoint {resume_path}")
         accelerator.load_state(resume_path)
         global_step = int(resume_path.split("-")[-1])
 
@@ -368,51 +376,11 @@ def train():
                 continue
 
             with accelerator.accumulate(unet):
-                (sweep_imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_labels) = batch
-                
-                # Depth Anything
-                depth_list = []
-                for b_idx in range(len(img_metas)):
-                    cam_filenames = img_metas[b_idx]['filename']  # list of V image paths
-                    view_depths = []
-                    for v_idx in range(len(cam_filenames)):
-                        path = cam_filenames[v_idx]   # e.g. "samples/CAM_FRONT/1234.jpg"
-                        # split to get cam + filename
-                        parts = path.split('/')       # ["samples", "CAM_FRONT", "1234.jpg"]
-                        cam = parts[1]; filename = parts[2].split('.')[0]
-
-                        # Load depth
-                        depth = np.load(f"{args.depth_root}/{cam}/{filename}.npy")
-                        depth = torch.from_numpy(depth).float()
-                        view_depths.append(depth)
-
-                    # stack views → (V, H, W)
-                    view_depths = torch.stack(view_depths)
-                    depth_list.append(view_depths)
-                    
-                # stack batches → (B, V, H, W)
-                depth_stack = torch.stack(depth_list).cuda()
-
-                if len(depth_labels.shape) == 5:
-                    lidar_depth = depth_labels[:, 0, ...].cuda()
-                if torch.cuda.is_available():
-                    for key, value in mats.items():
-                        mats[key] = value.cuda()
-                    sweep_imgs = sweep_imgs.cuda()
-                    gt_boxes = [gt_box.cuda() for gt_box in gt_boxes]
-                    gt_labels = [gt_label.cuda() for gt_label in gt_labels]
-
-                # DINO   
-                dino_out = get_dino(sweep_imgs[:, 0, ...], img_metas) # only key frame
-                dino_cond = get_dino_cond(dino_out)
-                
                 # Get BEV
                 with torch.no_grad():
-                    # latents = bev_model(return_loss=False, only_bev=True, **batch).detach()
-                    latents = bev_model(sweep_imgs, depth_stack, mats, img_metas, only_bev=True, dino_out=dino_cond).detach()
-                # latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
-                # latents = latents.permute(0, 3, 1, 2).contiguous()
-                latents = latents.contiguous()
+                    latents = bev_model(return_loss=False, only_bev=True, **batch).detach()
+                latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
+                latents = latents.permute(0, 3, 1, 2).contiguous()
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -426,6 +394,7 @@ def train():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # Get the target for loss depending on the prediction type
+
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "sample":
@@ -434,20 +403,39 @@ def train():
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                img = batch['img'].data[0]
+                len_queue = img.size(1)
+                img = img[:, -1, ...]
+                img_metas = [each[len_queue-1] for each in batch['img_metas'].data[0]]
+                dino_out = get_dino(img, img_metas)
+                dino_cond = get_dino_cond(dino_out)
+
+                cond = get_condition(batch)
                 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, dino_cond)[0]
+                # model_pred, multi_feat, _ = unet(noisy_latents, timesteps, dino_cond, **cond)
+                model_pred = unet(noisy_latents, timesteps, dino_cond, **cond)[0]
 
                 denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample" and global_step > step_threshold:
                 if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
-                    task_loss = get_task_loss(model_pred, sweep_imgs, depth_stack, mats, img_metas)
+                    task_loss = get_task_loss(model_pred, **batch)
                 else:
                     task_loss = 0
                     
-                total_loss = args.diffusion_loss_scale * denoise_loss + args.task_loss_scale * task_loss
-
+                # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
+                #     # Switch when global_step >= args.task_loss_switch_step.
+                #     if args.task_loss_switch_step is not None and global_step >= args.task_loss_switch_step:
+                #         if multi_feat is not None:
+                #             task_loss = get_task_loss(multi_feat, **batch)
+                #         else:
+                #             task_loss = get_task_loss(model_pred, **batch)
+                # else:
+                #     task_loss = 0
+                    
+                total_loss = denoise_loss + args.task_loss_scale * task_loss
+                
                 # get learing rate
                 lr = lr_scheduler.get_last_lr()[0]
 
@@ -521,7 +509,7 @@ def train():
                         logger.info(f"Saved state to {save_path}")
                         
                     unet.eval()
-                    if global_step in [30000, 50000, 80000, 100000]:
+                    if global_step in [30000, 50000]:
                         logger.info(f"Evaluating at epoch {epoch} step {global_step}")
                         with torch.no_grad():
                             eval_path = os.path.join(save_path, 'val')
@@ -532,12 +520,13 @@ def train():
                                                     dataset=val_dataset,
                                                     dataloader=val_dataloader,
                                                     bev_cfg=bev_cfg,
+                                                    eval='bbox',
                                                     save_path=eval_path,
-                                                    depth_path=args.depth_root,
                                                     noise_timesteps=5,
                                                     denoise_timesteps=5,
                                                     num_inference_steps=5,
-                                                    use_classifier_guidence=False)
+                                                    use_classifier_guidence=False,
+                                                    inversion=False)
 
                         if accelerator.is_main_process and args.report_to == "wandb":
                             for metric, score in eval_results.items():
@@ -709,7 +698,6 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
 
-
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -727,7 +715,7 @@ def parse_args():
     parser.add_argument(
         "--prediction_type",
         type=str,
-        default="sample",
+        default=None,
         help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'sample' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
     )
 
@@ -794,33 +782,13 @@ def parse_args():
         default=0.0
     )
     
-    
     parser.add_argument(
-        "--depth_save_dir",
-        type=str,
-        default=None
-    )
-    
-    parser.add_argument(
-        "--depth_root",
-        type=str,
-        default=None
-    )
-
-    parser.add_argument(
-        "--diffusion_loss_scale", 
-        type=float, 
-        default=0.0
-    )
-    
-    parser.add_argument(
-        "--enable_task_loss",
+        "--task_loss_switch_step",
         type=int,
-        default=30000,
-        help=("Enable task loss after certain steps."),
+        default=-1,
+        help="If >0, after this many optimization steps use multi_feat for task loss (if available). Default 0 -> always use model_pred."
     )
     
-
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:

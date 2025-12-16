@@ -5,20 +5,19 @@
 GPUS=4
 PORT=${PORT:-29501}
 
-BEV_CONFIG="../configs/bevdiffuser/dino_tiny.py"
-BEV_CHECKPOINT="../../ckpts/bevformer_tiny_epoch_24.pth"
+# BEV_CONFIG="../configs/bevdiffuser/dino_tiny.py"
+# BEV_CHECKPOINT="../../ckpts/bevformer_tiny_epoch_24.pth"
 PRETRAINED_MODEL="stabilityai/stable-diffusion-2-1"
 PRETRAINED_UNET_CHECKPOINT=None
 
 # set up wandb project
 PROJ_NAME=BEVDiffuser
-RUN_NAME=BEVDiffuser_tiny_DINO
-# checkpoint settings
+RUN_NAME=BEVDiffDepth_taskloss-1e4
 CHECKPOINT_STEP=10000
 CHECKPOINT_LIMIT=3
 
 # allow 500 extra steps to be safe
-MAX_TRAINING_STEPS=50000
+MAX_TRAINING_STEPS=100000
 TRAIN_BATCH_SIZE=1
 DATALOADER_NUM_WORKERS=4
 GRADIENT_ACCUMMULATION_STEPS=1
@@ -29,8 +28,8 @@ LR_SCHEDULER="constant" # constant, constant_with_warmup, polynomial, cosine_wit
 
 UNCOND_PROB=0.1   # 0.2 -> 0.1
 PREDICTION_TYPE="sample" # "sample", "epsilon" or "v_prediction"
-TASK_LOSS_SCALE=0.1 # 0.1
-
+TASK_LOSS_SCALE=1e-4 # 0.1
+DIFFUSION_LOSS_SCLAE=1.0
 OUTPUT_DIR="../../../results/stage1/${RUN_NAME}"
 # RESUME_FROM="../../../results/stage1/BEVDiffuser_tiny_GT-dino_only-dino_with-global/checkpoint-30000"
 
@@ -52,8 +51,6 @@ PYTHONPATH="$(dirname $0)/../..":$PYTHONPATH \
 torchrun --nproc_per_node $GPUS \
     --master_port=29505 \
   $(dirname "$0")/train_bev_diffuser_dino_v2.py \
-    --bev_config $BEV_CONFIG \
-    --bev_checkpoint $BEV_CHECKPOINT \
     --pretrained_unet_checkpoint $PRETRAINED_UNET_CHECKPOINT \
     --pretrained_model_name_or_path $PRETRAINED_MODEL \
     --train_batch_size $TRAIN_BATCH_SIZE \
@@ -70,7 +67,10 @@ torchrun --nproc_per_node $GPUS \
     --uncond_prob $UNCOND_PROB \
     --prediction_type $PREDICTION_TYPE \
     --task_loss_scale $TASK_LOSS_SCALE \
+    --diffusion_loss_scale 1.0 \
     --report_to 'tensorboard' \
+    # --bev_config $BEV_CONFIG \
+    # --bev_checkpoint $BEV_CHECKPOINT 
     # --resume_from_checkpoint $RESUME_FROM
     # --gradient_checkpointing \
 

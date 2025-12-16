@@ -448,12 +448,12 @@ class DINOLSSFPN(nn.Module):
         # depth = depth_feature[:, :self.depth_channels].softmax(   # [6, 112, 16, 44] -> [B*V, D, H, W]
         #     dim=1, dtype=depth_feature.dtype)
         
-        depth = lidar_depth # [6, 112, 35, 58] -> [B*V, D, H, W]
+        depth = lidar_depth # [B, V, H, W]
         
         if self.use_soft_depth:
             depth = self.get_lidar_depth_gaussian(lidar_depth)  # (B*V, D, H, W)
         else:
-            depth = self.get_lidar_depth_one_hot(lidar_depth)       # (B*V, D, H, W)
+            depth = self.get_lidar_depth_one_hot(lidar_depth)   # (B*V, D, H, W)
         
         geom_xyz = self.get_geometry(
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],

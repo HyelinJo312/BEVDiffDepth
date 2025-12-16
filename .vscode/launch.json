@@ -37,6 +37,7 @@
                 "--bev_config", "${workspaceFolder}/BEVDepth/bevdepth/projects/configs/bevdiffuser/dinobevdepth.py",
                 // "--bev_config", "${workspaceFolder}/BEVFormer/projects/configs/bevdiffuser/layout_tiny.py", 
                 // "--bev_checkpoint", "${workspaceFolder}/BEVFormer/ckpts/bevformer_tiny_epoch_24.pth",
+                "--depth_root", "${workspaceFolder}/BEVDepth/data/nuscenes_depth_da3/samples",
                 "--pretrained_unet_checkpoint", "None",
                 "--pretrained_model_name_or_path", "stabilityai/stable-diffusion-2-1",
                 "--train_batch_size", "1",
@@ -52,7 +53,9 @@
                 "--tracker_project_name", "debug_project",
                 "--uncond_prob", "0.2",
                 "--prediction_type", "sample",
-                "--task_loss_scale", "0.1",
+                "--task_loss_scale", "0.0001",
+                "--diffusion_loss_scale", "1.0",
+                "--enable_task_loss", "30000",
                 "--launcher", "none",
                 // "--depth_save_dir", "${workspaceFolder}/BEVFormer/projects/depth_map"
                 // "--task_loss_switch_step", "None"
@@ -68,10 +71,44 @@
                 "LOCAL_RANK": "0",
                 "WORLD_SIZE": "1",
                 "MASTER_ADDR": "127.0.0.1",
-                "MASTER_PORT": "29500",
+                "MASTER_PORT": "29501",
                 "TORCH_DISTRIBUTED_DEBUG ": "DETAIL"
 
             }
+        },
+
+        {
+            "name": "Test_bevdiffuser", 
+            "type": "debugpy",
+            "request": "launch",
+            //"module": "torch.distributed.launch",
+            //"justMyCode": true,
+            "program": "${workspaceFolder}/BEVDepth/bevdepth/projects//test_bev_diffuser_dino_v2.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--bev_config", "${workspaceFolder}/BBEVDepth/bevdepth/projects/configs/bevdiffuser/dinobevdepth.py", 
+                "--bev_checkpoint", "${workspaceFolder}/train/debug_output/checkpoint-10/bev_model.pth",
+                "--checkpoint_dir", "${workspaceFolder}/train/debug_output/checkpoint-10", 
+                "--prediction_type", "sample",
+                "--noise_timesteps", "5",
+                "--denoise_timesteps", "5", 
+                "--num_inference_steps", "5",
+                "--inversion","True"
+                
+            ],
+
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "RANK": "0",
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": "1",
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": "29501",
+                "TORCH_DISTRIBUTED_DEBUG ": "DETAIL"
+
+            }
+            
         },
 
         {

@@ -26,7 +26,7 @@ from .nn import (
     timestep_embedding,
 )
 from diffusers.utils.constants import SAFETENSORS_WEIGHTS_NAME
-from projects.bevdiffuser.ldm.modules.attention import SpatialTransformer
+from bevdepth.projects.ldm.modules.attention import SpatialTransformer
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import TORCH_VERSION, digit_version
 from .multiscale_fusion import *
