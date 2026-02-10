@@ -215,72 +215,51 @@ def map_pointcloud_to_image(
 
 
 class NuscDetDataset(Dataset):
-
     def __init__(self,
-                 ida_aug_conf,
-                 bda_aug_conf,
-                 classes,
-                 data_root,
-                 info_paths,
-                 is_train,
-                 use_cbgs=False,
-                 num_sweeps=1,
-                 img_conf=dict(img_mean=[123.675, 116.28, 103.53],
-                               img_std=[58.395, 57.12, 57.375],
-                               to_rgb=True),
-                 return_depth=False,
-                 sweep_idxes=list(),
-                 key_idxes=list(),
-                 use_fusion=False):
-        """Dataset used for bevdetection task.
-        Args:
-            ida_aug_conf (dict): Config for ida augmentation.
-            bda_aug_conf (dict): Config for bda augmentation.
-            classes (list): Class names.
-            use_cbgs (bool): Whether to use cbgs strategy,
-                Default: False.
-            num_sweeps (int): Number of sweeps to be used for each sample.
-                default: 1.
-            img_conf (dict): Config for image.
-            return_depth (bool): Whether to use depth gt.
-                default: False.
-            sweep_idxes (list): List of sweep idxes to be used.
-                default: list().
-            key_idxes (list): List of key idxes to be used.
-                default: list().
-            use_fusion (bool): Whether to use lidar data.
-                default: False.
-        """
+                 cfg,
+                 depth_path=None,
+                 load_depth_dtype=np.float32):
         super().__init__()
+        self.ida_aug_conf = cfg.ida_aug_conf
+        self.bda_aug_conf = cfg.bda_aug_conf
+        self.classes = cfg.classes
+        self.data_root = cfg.data_root
+        self.is_train = cfg.is_train
+        self.use_cbgs = getattr(cfg, "use_cbgs", False)
+
+        info_paths = cfg.info_paths
         if isinstance(info_paths, list):
-            self.infos = list()
-            for info_path in info_paths:
-                self.infos.extend(mmcv.load(info_path))
+            self.infos = []
+            for p in info_paths:
+                self.infos.extend(mmcv.load(p))
         else:
             self.infos = mmcv.load(info_paths)
-        self.is_train = is_train
-        self.ida_aug_conf = ida_aug_conf
-        self.bda_aug_conf = bda_aug_conf
-        self.data_root = data_root
-        self.classes = classes
-        self.use_cbgs = use_cbgs
+
         if self.use_cbgs:
             self.cat2id = {name: i for i, name in enumerate(self.classes)}
             self.sample_indices = self._get_sample_indices()
-        self.num_sweeps = num_sweeps
-        self.img_mean = np.array(img_conf['img_mean'], np.float32)
-        self.img_std = np.array(img_conf['img_std'], np.float32)
-        self.to_rgb = img_conf['to_rgb']
-        self.return_depth = return_depth
-        assert sum([sweep_idx >= 0 for sweep_idx in sweep_idxes]) \
-            == len(sweep_idxes), 'All `sweep_idxes` must greater \
-                than or equal to 0.'
 
-        self.sweeps_idx = sweep_idxes
-        assert sum([key_idx < 0 for key_idx in key_idxes]) == len(key_idxes),\
-            'All `key_idxes` must less than 0.'
+        self.num_sweeps = cfg.num_sweeps
+
+        img_conf = cfg.img_conf
+        self.img_mean = np.array(img_conf["img_mean"], np.float32)
+        self.img_std  = np.array(img_conf["img_std"],  np.float32)
+        self.to_rgb   = img_conf["to_rgb"]
+
+        self.return_depth = cfg.return_depth
+
+        # mutable default 방지
+        self.sweeps_idx = list(getattr(cfg, "sweep_idxes", []))
+        key_idxes = list(getattr(cfg, "key_idxes", []))
+
+        assert all(s >= 0 for s in self.sweeps_idx)
+        assert all(k < 0 for k in key_idxes)
         self.key_idxes = [0] + key_idxes
-        self.use_fusion = use_fusion
+
+        self.use_fusion = cfg.use_fusion
+
+        self.depth_path = depth_path
+        self.load_depth_dtype = load_depth_dtype
 
     def _get_sample_indices(self):
         """Load annotations from ann_file.
@@ -316,6 +295,24 @@ class NuscDetDataset(Dataset):
                                                int(len(cls_inds) *
                                                    ratio)).tolist()
         return sample_indices
+    
+    def _load_depth_from_filenames(self, filenames):
+        """
+        filenames: list[str]  # e.g. ["samples/CAM_FRONT/123.jpg", ...] length=V
+        return: torch.FloatTensor (V, H, W)
+        """
+        assert self.depth_path is not None, "depth_path must be provided to load depth maps."
+        view_depths = []
+        for path in filenames:
+            parts = path.split('/')
+            # parts = ["samples", "CAM_FRONT", "123.jpg"]
+            cam = parts[1]
+            filename = parts[2].split('.')[0]
+            npy_path = os.path.join(self.depth_path, cam, f"{filename}.npy")
+            depth = np.load(npy_path).astype(self.load_depth_dtype, copy=False)
+            view_depths.append(torch.from_numpy(depth).float())
+        return torch.stack(view_depths, dim=0)  # (V, H, W)
+
 
     def sample_ida_augmentation(self):
         """Generate ida augmentation values based on ida_config."""
@@ -556,6 +553,11 @@ class NuscDetDataset(Dataset):
             sweep_timestamps.append(torch.tensor(timestamps))
             if self.return_depth:
                 sweep_lidar_depth.append(torch.stack(lidar_depth))
+                
+        sweep_filenames = []
+        for cam_info in cam_infos:
+            sweep_filenames.append([cam_info[cam]['filename'] for cam in cams])
+            
         # Get mean pose of all cams.
         ego2global_rotation = np.mean(
             [key_info[cam]['ego_pose']['rotation'] for cam in cams], 0)
@@ -566,6 +568,7 @@ class NuscDetDataset(Dataset):
             ego2global_translation=ego2global_translation,
             ego2global_rotation=ego2global_rotation,
             filename=[key_info[cam]['filename'] for cam in cams],
+            sweep_filenames=sweep_filenames,          
         )
         
         if lidar_infos is not None:
@@ -669,37 +672,33 @@ class NuscDetDataset(Dataset):
             # frame or previous key frame is from another scene.
             if cur_idx < 0:
                 cur_idx = idx
-            elif self.infos[cur_idx]['scene_token'] != self.infos[idx][
-                    'scene_token']:
+            elif self.infos[cur_idx]['scene_token'] != self.infos[idx]['scene_token']:
                 cur_idx = idx
             info = self.infos[cur_idx]
             cam_infos.append(info['cam_infos'])
             lidar_infos.append(info['lidar_infos'])
-            lidar_sweep_timestamps = [
-                lidar_sweep['LIDAR_TOP']['timestamp']
-                for lidar_sweep in info['lidar_sweeps']
-            ]
-            for sweep_idx in self.sweeps_idx:
-                if len(info['cam_sweeps']) == 0:
-                    cam_infos.append(info['cam_infos'])
-                    lidar_infos.append(info['lidar_infos'])
-                else:
-                    # Handle scenarios when current sweep doesn't have all
-                    # cam keys.
-                    for i in range(min(len(info['cam_sweeps']) - 1, sweep_idx),
-                                   -1, -1):
-                        if sum([cam in info['cam_sweeps'][i]
-                                for cam in cams]) == len(cams):
-                            cam_infos.append(info['cam_sweeps'][i])
-                            cam_timestamp = np.mean([
-                                val['timestamp']
-                                for val in info['cam_sweeps'][i].values()
-                            ])
-                            # Find the closest lidar frame to the cam frame.
-                            lidar_idx = np.abs(lidar_sweep_timestamps -
-                                               cam_timestamp).argmin()
-                            lidar_infos.append(info['lidar_sweeps'][lidar_idx])
-                            break
+
+            # for sweep_idx in self.sweeps_idx:
+            #     if len(info['cam_sweeps']) == 0:
+            #         cam_infos.append(info['cam_infos'])
+            #         lidar_infos.append(info['lidar_infos'])
+            #     else:
+            #         # Handle scenarios when current sweep doesn't have all
+            #         # cam keys.
+            #         for i in range(min(len(info['cam_sweeps']) - 1, sweep_idx),
+            #                        -1, -1):
+            #             if sum([cam in info['cam_sweeps'][i]
+            #                     for cam in cams]) == len(cams):
+            #                 cam_infos.append(info['cam_sweeps'][i])
+            #                 cam_timestamp = np.mean([
+            #                     val['timestamp']
+            #                     for val in info['cam_sweeps'][i].values()
+            #                 ])
+            #                 # Find the closest lidar frame to the cam frame.
+            #                 lidar_idx = np.abs(lidar_sweep_timestamps -
+            #                                    cam_timestamp).argmin()
+            #                 lidar_infos.append(info['lidar_sweeps'][lidar_idx])
+            #                 break
         if self.return_depth or self.use_fusion:
             image_data_list = self.get_image(cam_infos, cams, lidar_infos)
 
@@ -716,6 +715,14 @@ class NuscDetDataset(Dataset):
             img_metas,
         ) = image_data_list[:7]
         img_metas['token'] = self.infos[idx]['sample_token']
+        
+        # Sweep depths
+        sweep_depths = []
+        for filenames in img_metas['sweep_filenames']:   
+            depth_s = self._load_depth_from_filenames(filenames)  # (V,H,W)
+            sweep_depths.append(depth_s)
+        depth = torch.stack(sweep_depths, dim=0)  # (num_sweeps,V,H,W)
+    
         if self.is_train:
             gt_boxes, gt_labels = self.get_gt(self.infos[idx], cams)
         # Temporary solution for test.
@@ -744,6 +751,8 @@ class NuscDetDataset(Dataset):
         ]
         if self.return_depth:
             ret_list.append(image_data_list[7])
+        if depth is not None:
+            ret_list.append(depth)
         return ret_list
 
     def __str__(self):
@@ -758,7 +767,7 @@ class NuscDetDataset(Dataset):
             return len(self.infos)
 
 
-def collate_fn(data, is_return_depth=False):
+def collate_fn(data, is_return_depth=False, has_depth_any=False):
     imgs_batch = list()
     sensor2ego_mats_batch = list()
     intrin_mats_batch = list()
@@ -770,6 +779,7 @@ def collate_fn(data, is_return_depth=False):
     gt_labels_batch = list()
     img_metas_batch = list()
     depth_labels_batch = list()
+    depth_batch = list()
     for iter_data in data:
         (
             sweep_imgs,
@@ -783,9 +793,15 @@ def collate_fn(data, is_return_depth=False):
             gt_boxes,
             gt_labels,
         ) = iter_data[:10]
+        cursor = 10
         if is_return_depth:
             gt_depth = iter_data[10]
             depth_labels_batch.append(gt_depth)
+            cursor += 1
+        if has_depth_any:
+            depth = iter_data[cursor]          # (V,H,W)
+            depth_batch.append(depth)
+            cursor += 1
         imgs_batch.append(sweep_imgs)
         sensor2ego_mats_batch.append(sweep_sensor2ego_mats)
         intrin_mats_batch.append(sweep_intrins)
@@ -812,4 +828,6 @@ def collate_fn(data, is_return_depth=False):
     ]
     if is_return_depth:
         ret_list.append(torch.stack(depth_labels_batch))
+    if has_depth_any:
+        ret_list.append(torch.stack(depth_batch))  # (B,V,H,W)
     return ret_list

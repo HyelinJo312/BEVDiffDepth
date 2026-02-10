@@ -226,7 +226,7 @@ class BEVDepthLightningModel(LightningModule):
         self.downsample_factor = self.backbone_conf['downsample_factor']
         self.dbound = self.backbone_conf['d_bound']
         self.depth_channels = int(
-            (self.dbound[1] - self.dbound[0]) / self.dbound[2])
+            (self.dbound[1] - self.dbound[0]) / self.dbound[2]) # type: ignore
         self.use_fusion = False
         self.train_info_paths = os.path.join(self.data_root,
                                              'nuscenes_infos_train.pkl')
@@ -306,7 +306,7 @@ class BEVDepthLightningModel(LightningModule):
                                    W // self.downsample_factor)
 
         gt_depths = (gt_depths -
-                     (self.dbound[0] - self.dbound[2])) / self.dbound[2]
+                     (self.dbound[0] - self.dbound[2])) / self.dbound[2] # type: ignore
         gt_depths = torch.where(
             (gt_depths < self.depth_channels + 1) & (gt_depths >= 0.0),
             gt_depths, torch.zeros_like(gt_depths))

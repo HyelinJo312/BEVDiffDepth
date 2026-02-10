@@ -1,5 +1,40 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": []
+    "python.analysis.typeCheckingMode": "off",
+    // "basedpyright.disableLanguageServices": false,
+    "python.analysis.exclude": [
+        "**/data",
+        "**/results*",
+        "**/build",
+        "**/mmdetection3d"
+    ],
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/.hg/store/**": true,
+        "**/build/**": true,
+        "**/data/**": true,
+        "**/outputs/**": true,
+        "**/vis/**": true,
+        "**/work_dirs/**": true,
+        "**/mmdet3d/**": true,
+        "**/mmdetection3d/**": true,
+        "**/results/**": true,
+        "**/assets/**": true,
+    },
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/bower_components": true,
+        "**/*.code-search": true,
+        "**/build/**": true,
+        "**/data/**": true,
+        "**/outputs/**": true,
+        "**/vis/**": true,
+        "**/work_dirs/**": true,
+        "**/mmdet3d/**": true,
+        "**/mmdetection3d/**": true,
+        "**/results/**": true,
+        "**/assets/**": true,
+    },
 }

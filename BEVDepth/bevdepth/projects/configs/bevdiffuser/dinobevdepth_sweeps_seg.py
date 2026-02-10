@@ -6,7 +6,6 @@ import os
 
 H = 900
 W = 1600
-# final_dim = (480, 900)
 final_dim = (448, 798)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
@@ -17,6 +16,7 @@ _ffn_dim_ = _dim_*2
 _num_levels_ = 1
 bev_h_ = 128
 bev_w_ = 128
+bev_dim = 80
 
 CLASSES = [
     'car',
@@ -31,6 +31,7 @@ CLASSES = [
     'traffic_cone',
 ]
 
+# layout encoder
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 num_bboxes = 300
 num_classes = len(CLASSES) + 2
@@ -41,21 +42,23 @@ backbone_conf = {
     'x_bound': [-51.2, 51.2, 0.8],
     'y_bound': [-51.2, 51.2, 0.8],
     'z_bound': [-5, 3, 8],
-    'd_bound': [2.0, 58.0, 0.25],
+    'd_bound': [2.0, 58.0, 0.5],
     'final_dim': final_dim,
-    'output_channels': 128,
-    'downsample_factor': 14,  # 16   # TODO: DINOv2 patch size=14 고려해서 14의 배수로 해봐도 괜찮을듯,
+    'output_channels': bev_dim,
+    'downsample_factor': 14,  # 16  
     'use_soft_depth': True,
 }
 
 ida_aug_conf = {
     # 'resize_lim': (0.386, 0.55),
-    'resize_lim': (0.55, 0.70),
+    'resize_lim': (0.50, 0.50),
     'final_dim': final_dim,
-    'rot_lim': (-5.4, 5.4),
+    # 'rot_lim': (-5.4, 5.4),
+    'rot_lim': (0.0, 0.0),
     'H': H,
     'W': W,
-    'rand_flip': True,
+    # 'rand_flip': True,
+    'rand_flip': False,
     'bot_pct_lim': (0.0, 0.0),
     'cams': [
         'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
@@ -65,32 +68,34 @@ ida_aug_conf = {
 }
 
 bda_aug_conf = {
-    'rot_lim': (-22.5, 22.5),
-    'scale_lim': (0.95, 1.05),
-    'flip_dx_ratio': 0.5,
-    'flip_dy_ratio': 0.5
+    # 'rot_lim': (-22.5, 22.5),
+    'rot_lim': (0, 0),
+    # 'scale_lim': (0.95, 1.05),
+    'scale_lim': (1.0, 1.0),
+    'flip_dx_ratio': 0.0, # 0.5
+    'flip_dy_ratio': 0.0 # 0.5
 }
 
 bev_backbone = dict(
     type='ResNet',
-    in_channels=256,
+    in_channels=bev_dim*2,# 256
     depth=18,
     num_stages=3,
     strides=(1, 2, 2),
     dilations=(1, 1, 1),
     out_indices=[0, 1, 2],
     norm_eval=False,
-    base_channels=256,
+    base_channels=bev_dim*2, # 256
 )
 
 bev_neck = dict(type='SECONDFPN',
-                in_channels=[80, 160, 320, 640],
+                # in_channels=[256, 256, 512, 1024],
+                in_channels=[160, 160, 320, 640],
                 upsample_strides=[1, 2, 4, 8],
                 out_channels=[64, 64, 64, 64])
 
-
 # unet = dict(
-#     type='layout_diffusion.diffusion_unet.UNetModel',
+#     type='layout_diffusion.diffusion_unet_v2.UNetModel',
 #     parameters=dict(
 #         image_size=bev_h_,
 #         use_fp16=False,
@@ -117,16 +122,18 @@ bev_neck = dict(type='SECONDFPN',
 
 unet = dict(
     # type='layout_diffusion.layout_dino_diffusion_unet.LayoutDiffusionUNetModel',
-    type='layout_diffusion.layout_dino_diffusion_unet_v2.LayoutDiffusionUNetModel',
+    type='layout_diffusion.diffusion_unet_v1_seg.DiffusionUNetModel',
     parameters=dict(
         image_size=bev_h_,
         use_fp16=False,
         use_scale_shift_norm=True,
         return_multiscale=False,
-        in_channels=_dim_,
-        out_channels=_dim_,
+        # in_channels=_dim_,
+        in_channels=bev_dim*2,
+        # out_channels=_dim_,
+        out_channels=bev_dim*2,
         model_channels=256,
-        context_dim=256,  # 768 (original DINOv2)
+        context_dim=bev_dim*2,  
         encoder_channels=256, # assert same as layout_encoder.hidden_dim
         num_head_channels=32,
         num_heads=-1,
@@ -139,27 +146,27 @@ unet = dict(
         attention_ds=[ 4, 2, 1 ],
         channel_mult=[ 1, 2, 4 ],
         dropout=0.0,
-        use_checkpoint=False,
-        use_positional_embedding_for_attention=True,
-        attention_block_type='ObjectAwareCrossAttention',
-        layout_encoder=dict(
-            type='layout_diffusion.layout_encoder.LayoutTransformerEncoder',
-            parameters=dict(
-                used_condition_types=['obj_class', 'obj_bbox', 'is_valid_obj'],
-                layout_length=num_bboxes,
-                num_classes_for_layout_object=num_classes,
-                mask_size_for_layout_object=0,
-                hidden_dim=256,
-                output_dim=1024, # model_channels x 4
-                num_layers=6,
-                num_heads=8,
-                use_final_ln=True,
-                use_positional_embedding=False,
-                resolution_to_attention=[16, 32, 64], #[ 12, 25, 50 ],
-                use_key_padding_mask=False,
-                use_3d_bbox=use_3d_bbox),
-            ),
-    )
+        use_checkpoint=False,)
+        # use_positional_embedding_for_attention=True,
+        # attention_block_type='ObjectAwareCrossAttention',
+    #     layout_encoder=dict(
+    #         type='layout_diffusion.layout_encoder.LayoutTransformerEncoder',
+    #         parameters=dict(
+    #             used_condition_types=['obj_class', 'obj_bbox', 'is_valid_obj'],
+    #             layout_length=num_bboxes,
+    #             num_classes_for_layout_object=num_classes,
+    #             mask_size_for_layout_object=0,
+    #             hidden_dim=256,
+    #             output_dim=1024, # model_channels x 4
+    #             num_layers=6,
+    #             num_heads=8,
+    #             use_final_ln=True,
+    #             use_positional_embedding=False,
+    #             resolution_to_attention=[16, 32, 64], #[ 12, 25, 50 ],
+    #             use_key_padding_mask=False,
+    #             use_3d_bbox=use_3d_bbox),
+    #         ),
+    # )
 )
 
 
@@ -198,7 +205,8 @@ train_cfg = dict(
     gaussian_overlap=0.1,
     max_objs=500,
     min_radius=2,
-    code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5],
+    # code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5],
+    code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
 )
 
 test_cfg = dict(
@@ -230,17 +238,17 @@ head_conf = {
     'min_radius': 2,
 }
 
-# data_root='data/nuScenes'
+
 # data_root = 'BEVDepth/data/nuScenes/'
 data_root = '../../data/nuScenes/'
-train_info_paths = os.path.join(data_root,'nuscenes_infos_train.pkl')
-val_info_paths = os.path.join(data_root,'nuscenes_infos_val.pkl')
 data_use_cbgs = False
-num_sweeps = 1
+num_sweeps = 2
 sweep_idxes = list()
-key_idxes = list()
-data_return_depth = True
+key_idxes = [-1]
+data_return_depth = False
 use_fusion = True
+use_semantics = True
+use_layout = False
 batch_size_per_device = 1
 
 
@@ -249,7 +257,9 @@ data = dict(
     train=dict(
         type='CustomNuScenesDiffusionDataset_layout',
         data_root=data_root,
-        info_paths=data_root + 'nuscenes_infos_train.pkl',
+        info_paths=data_root + 'nuscenes_infos_train_temporal.pkl', 
+        depth_path=data_root + 'nuscenes_depth_da3',
+        semantic_path=data_root + 'nuscenes_semantic',
         ida_aug_conf=ida_aug_conf,
         bda_aug_conf=bda_aug_conf,
         classes=CLASSES,
@@ -261,6 +271,9 @@ data = dict(
         key_idxes=key_idxes,
         return_depth=data_return_depth,
         use_fusion=use_fusion,
+        use_semantics=use_semantics,
+        use_layout=use_layout,
+        downsample_size=final_dim,
         box_type_3d='LiDAR',
         pc_range=point_cloud_range,
         use_3d_bbox=use_3d_bbox,
@@ -270,7 +283,9 @@ data = dict(
     test=dict(
         type='CustomNuScenesDiffusionDataset_layout',
         data_root=data_root,
-        info_paths=data_root + 'nuscenes_infos_val.pkl',
+        info_paths=data_root + 'nuscenes_infos_val_temporal.pkl',
+        depth_path=data_root + 'nuscenes_depth_da3',
+        semantic_path=data_root + 'nuscenes_semantic_val',
         ida_aug_conf=ida_aug_conf,
         bda_aug_conf=bda_aug_conf,
         classes=CLASSES,
@@ -282,6 +297,9 @@ data = dict(
         key_idxes=key_idxes,
         return_depth=data_return_depth,
         use_fusion=use_fusion,
+        use_semantics=use_semantics,
+        use_layout=use_layout,
+        downsample_size=final_dim,
         box_type_3d='LiDAR',
         pc_range=point_cloud_range,
         use_3d_bbox=use_3d_bbox,
@@ -291,7 +309,9 @@ data = dict(
     val=dict(
         type='CustomNuScenesDiffusionDataset_layout',
         data_root=data_root,
-        info_paths=data_root + 'nuscenes_infos_val.pkl',
+        info_paths=data_root + 'nuscenes_infos_val_temporal.pkl',
+        depth_path=data_root + 'nuscenes_depth_da3',
+        semantic_path=data_root + 'nuscenes_semantic_val',
         ida_aug_conf=ida_aug_conf,
         bda_aug_conf=bda_aug_conf,
         classes=CLASSES,
@@ -303,6 +323,9 @@ data = dict(
         key_idxes=key_idxes,
         return_depth=data_return_depth,
         use_fusion=use_fusion,
+        use_semantics=use_semantics,
+        use_layout=use_layout,
+        downsample_size=final_dim,
         box_type_3d='LiDAR',
         pc_range=point_cloud_range,
         use_3d_bbox=use_3d_bbox,

@@ -30,7 +30,7 @@ from accelerate.utils import set_seed
 from packaging import version
 from transformers import CLIPTextModel, CLIPTokenizer
 # from diffusers import DDPMScheduler, DDIMScheduler, UNet2DConditionModel
-
+from functools import partial
 import mmcv
 from mmcv import Config
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -38,14 +38,19 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint, wrap_fp16_mo
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))+"/..")
-from projects.mmdet3d_plugin.datasets.builder import build_dataloader
-from projects.mmdet3d_plugin.bevformer.apis.test import custom_encode_mask_results, collect_results_cpu
+# from bevdepth.datasets.nusc_det_dataset_v2 import NuscDetDataset, collate_fn
+from bevdepth.projects.utils.data_utils import CustomNuScenesDiffusionDataset, collate_fn, DistributedGroupSampler
+# from bevdepth.projects.mmdet3d_plugin.datasets.builder import build_dataloader
+# from bevdepth.projects.mmdet3d_plugin.bevformer.apis.test import custom_encode_mask_results, collect_results_cpu
 from mmdet.apis import set_random_seed
 
-from scheduler_utils import DDIMGuidedScheduler
-from model_utils import get_bev_model, build_unet, instantiate_from_config
-from layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
-from projects.bevdiffuser.fm_feature import GetDINOv2Cond, GetCLIPCond
+from bevdepth.projects.utils.scheduler_utils import DDIMGuidedScheduler
+from bevdepth.projects.utils.model_utils import get_bev_model, build_unet, instantiate_from_config, get_bevdepth_model
+from bevdepth.projects.layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
+from bevdepth.projects.fm_feature import GetDINOV2Feat
+from bevdepth.utils.torch_dist import all_gather_object, get_rank, synchronize
+from bevdepth.evaluators.det_evaluators import DetNuscEvaluator
+from torch.utils.data.distributed import DistributedSampler
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -99,7 +104,7 @@ def parse_args():
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
-    
+
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -157,6 +162,10 @@ def test():
     if args.launcher != 'none':
         init_dist(args.launcher, **bev_cfg.dist_params)
         
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMGuidedScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -164,48 +173,45 @@ def test():
     if args.prediction_type is not None:
         noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     
-    bev_model = get_bev_model(args)
-    if not args.use_classifier_guidence:
-        bev_model.requires_grad_(False)
+    bev_model = get_bevdepth_model(bev_cfg, args).to(device)
+    bev_model.requires_grad_(False)
     bev_model.eval()
-    
+
+    # unet = build_unet(bev_cfg.unet)
     unet = instantiate_from_config(bev_cfg.unet)
     unet.from_pretrained(args.checkpoint_dir, subfolder="unet")
-    unet.to(bev_model.device, dtype=torch.float32)
+    unet.to(device, dtype=torch.float32)
     unet.requires_grad_(False) 
     unet.eval()
     
-    get_dino = GetDINOv2Cond()
-    get_clip = GetCLIPCond()
+    get_dino = GetDINOV2Feat()
+
+    # dataset = NuscDetDataset(bev_cfg.data.val)
+    dataset = CustomNuScenesDiffusionDataset(bev_cfg.data.val)
     
-    bev_cfg.data.test.test_mode = True
-    bev_cfg.data.test.load_annos = True
-    dataset = build_dataset(bev_cfg.data.test,
-                            default_args={
-                                        'pc_range': bev_cfg.point_cloud_range,
-                                        'use_3d_bbox': bev_cfg.use_3d_bbox,
-                                        'num_classes': bev_cfg.num_classes,
-                                        'num_bboxes': bev_cfg.num_bboxes,
-                                    })
-    dataloader = build_dataloader(
+    rank, world_size = get_dist_info()
+    
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    
+    dataloader = torch.utils.data.DataLoader(
         dataset,
-        samples_per_gpu=bev_cfg.data.samples_per_gpu,
-        workers_per_gpu=bev_cfg.data.workers_per_gpu,
-        dist=(args.launcher != 'none'),
+        batch_size=bev_cfg.batch_size_per_device,
         shuffle=False,
-        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
+        collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, 
+                    has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+        num_workers=4,
+        sampler=sampler,
     )
-  
-    save_path = os.path.join('../../test', args.bev_config.split('/')[-1].split('.')[-2], args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
-        
+    save_path = os.path.join('../../../results/test', args.bev_config.split('/')[-1].split('.')[-2], args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
+
     evaluate(unet=unet,
              bev_model=bev_model,
              get_dino=get_dino,
-             get_clip=get_clip,
              noise_scheduler=noise_scheduler,
              dataset=dataset,
              dataloader=dataloader,
              bev_cfg=bev_cfg,
+             device=device,
              eval=args.eval,
              save_path=save_path,
              noise_timesteps=args.noise_timesteps,
@@ -217,18 +223,19 @@ def test():
 def evaluate(unet,
              bev_model,
              get_dino,
-             get_clip,
              noise_scheduler,
              dataset,
              dataloader,
              bev_cfg,
+             device,
              eval='bbox',
              save_path='',
              noise_timesteps=0,
              denoise_timesteps=0,
              num_inference_steps=0,
-             use_classifier_guidence=False):
-    
+             use_classifier_guidence=False,
+             max_eval_steps=None):
+             
     def get_classifier_gradient(x, **kwargs):
         x_ = x.detach().requires_grad_(True)
         x_ = x_.permute(0, 2, 3, 1)
@@ -237,61 +244,35 @@ def evaluate(unet,
         gradient = torch.autograd.grad(loss, x_)[0]
         gradient = gradient.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
         gradient = gradient.permute(0, 3, 1, 2)
-        return gradient
+        return gradient    
     
-    def get_condition(batch, use_cond=True):
-        cond = {}
-        if 'layout_obj_classes' in batch:
-            cond['obj_class'] = torch.stack(batch['layout_obj_classes'].data[0])
-        if 'layout_obj_bboxes' in batch:
-            cond['obj_bbox'] = torch.stack(batch['layout_obj_bboxes'].data[0])
-        if 'layout_obj_is_valid' in batch:
-            cond['is_valid_obj'] = torch.stack(batch['layout_obj_is_valid'].data[0]) 
-        if 'layout_obj_names' in batch:
-            cond['obj_name'] = torch.stack(batch['layout_obj_names'].data[0])
-        
-        if not use_cond:
-            if isinstance(unet, LayoutDiffusionUNetModel):
-                if 'obj_class' in unet.layout_encoder.used_condition_types:
-                    cond['obj_class'] = torch.ones_like(cond['obj_class']).fill_(unet.layout_encoder.num_classes_for_layout_object - 1)
-                    cond['obj_class'][:, 0] = unet.layout_encoder.num_classes_for_layout_object - 2
-                if 'obj_name' in unet.layout_encoder.used_condition_types:
-                    cond['obj_name'] = torch.stack(batch['default_obj_names'].data[0])
-                if 'obj_bbox' in unet.layout_encoder.used_condition_types:
-                    cond['obj_bbox'] = torch.zeros_like(cond['obj_bbox'])
-                    if unet.layout_encoder.use_3d_bbox:
-                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 0, 1, 1, 1, 0, 0, 0])
-                    else:
-                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 1, 1])
-                cond['is_valid_obj'] = torch.zeros_like(cond['is_valid_obj'])
-                cond['is_valid_obj'][:, 0] = 1.0 
-        for key, value in cond.items():
-            if isinstance(value, torch.Tensor):
-                cond[key] = value.to(latents.device)            
-        return cond
-    
-    det_res_path = f"{noise_timesteps}_{denoise_timesteps}_{num_inference_steps}"
-    bbox_results = []
-    mask_results = []
-    have_mask = False
-    
+    evaluator = DetNuscEvaluator(class_names=bev_cfg.CLASSES, data_root=bev_cfg.data_root, output_dir=save_path)
+
     rank, world_size = get_dist_info()
+
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     
+    all_pred_results = list()
+    all_img_metas = list()
+    
     for step, batch in enumerate(dataloader):
+        (imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_maps, segmaps) = batch
         
-        latents = bev_model(return_loss=False, only_bev=True, **batch).detach()
+        depth = depth_maps.to(device=device)
+        segmaps = segmaps.to(device=device)
         
-        latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
-        
-        latents = latents.permute(0, 3, 1, 2)
-
-        img = batch['img'][0].data[0]
-        img_metas = batch['img_metas'][0].data[0]
-        
-        def get_uncond(cond):
+        # if len(depth_labels.shape) == 5:
+        #     lidar_depth = depth_labels[:, 0, ...].to(device)
+        if torch.cuda.is_available():
+            for key, value in mats.items():
+                mats[key] = value.to(device)
+            imgs = imgs.to(device)
+            gt_boxes = [gt_box.to(device) for gt_box in gt_boxes]
+            gt_labels = [gt_label.to(device) for gt_label in gt_labels]
+    
+        def get_dino_uncond(cond):
             uncond = {k: v.clone() if isinstance(v, torch.Tensor) else v
                      for k, v in cond.items()}
             last_cls_u = torch.zeros_like(cond['last_cls'])  # (B,V,C_in)
@@ -299,81 +280,75 @@ def evaluate(unet,
             uncond['last_cls'] = last_cls_u
             uncond['last_tokens'] = last_tokens_u
             return uncond
+
+        def get_segmaps_uncond(segmaps):
+            return torch.zeros_like(segmaps)
         
+        dino_cond = get_dino(imgs, img_metas)
+        dino_uncond = get_dino_uncond(dino_cond) 
+        segmaps_uncond = get_segmaps_uncond(segmaps)
         
+        latents = bev_model(imgs, depth, mats, img_metas, only_bev=True, dino_out=dino_cond).detach()
+    
         if noise_timesteps > 0:
             if noise_timesteps > 1000:
                 latents = torch.randn_like(latents)
                 latents = latents * noise_scheduler.init_noise_sigma
             else:   
                 noise = torch.randn_like(latents)
-                noise_timesteps = torch.tensor(noise_timesteps).long()   
+                noise_timesteps = torch.as_tensor(noise_timesteps).long()   
                 latents = noise_scheduler.add_noise(latents, noise, noise_timesteps)
         
         if denoise_timesteps > 0:    
-            dino_cond = get_dino(img, img_metas)    
-            dino_uncond = get_uncond(dino_cond)
-            clip_cond = get_clip(img, img_metas)  
-            clip_uncond = get_uncond(clip_cond)
-            cond = [dino_cond, clip_cond]
-            uncond = [dino_uncond, clip_uncond]
-              
             # # DDIM
+            # layout_cond, layout_uncond = get_condition(gt_layout, use_cond=True), get_condition(gt_layout, use_cond=False)
             noise_scheduler.config.num_train_timesteps=denoise_timesteps
             noise_scheduler.set_timesteps(num_inference_steps=num_inference_steps)
-        
-            for _, t in enumerate(noise_scheduler.timesteps):
+            
+            for _, t in enumerate(noise_scheduler.timesteps): 
                 t_batch = torch.tensor([t] * latents.shape[0], device=latents.device)
-                noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, uncond)[0], unet(latents, t_batch, cond)[0]
+                noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, mats, dino_uncond, segmaps_uncond, depth)[0], unet(latents, t_batch, mats, dino_cond, segmaps, depth)[0]
+                # noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, mats, dino_uncond, **layout_uncond)[0], unet(latents, t_batch, mats, dino_cond, **layout_cond)[0]
                 noise_pred = noise_pred_uncond + 2 * (noise_pred_cond - noise_pred_uncond)
                 classifier_gradient = get_classifier_gradient(latents, **batch) if use_classifier_guidence else None
                 latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False, classifier_gradient=classifier_gradient)[0]
-    
-        # get detection results
-        latents = latents.permute(0, 2, 3, 1)            
-        latents = latents.reshape(-1, bev_cfg.bev_h_*bev_cfg.bev_w_, bev_cfg._dim_)
-        det_result = bev_model(return_loss=False, only_bev=False, given_bev=latents, rescale=True, **batch)
         
-        if isinstance(det_result, dict):
-            if 'bbox_results' in det_result.keys():
-                bbox_result = det_result['bbox_results']
-                batch_size = len(det_result['bbox_results'])
-                bbox_results.extend(bbox_result)
-            if 'mask_results' in det_result.keys() and det_result['mask_results'] is not None:
-                mask_result = custom_encode_mask_results(det_result['mask_results'])
-                mask_results.extend(mask_result)
-                have_mask = True
+        # get detection results
+        preds = bev_model(imgs, depth, mats, img_metas, given_bev=latents) 
+
+        if isinstance(bev_model, torch.nn.parallel.DistributedDataParallel):
+            results = bev_model.module.get_bboxes(preds, img_metas)
         else:
-            batch_size = len(det_result)
-            bbox_results.extend(det_result)
-            
+            results = bev_model.get_bboxes(preds, img_metas)
+        for i in range(len(results)):
+            results[i][0] = results[i][0].detach().cpu().numpy()
+            results[i][1] = results[i][1].detach().cpu().numpy()
+            results[i][2] = results[i][2].detach().cpu().numpy()
+            results[i].append(img_metas[i])
+    
+        for predict_step_output in results:
+            all_pred_results.append(predict_step_output[:3])
+            all_img_metas.append(predict_step_output[3])
+        
+        batch_size = len(results)
         if rank == 0:
             for _ in range(batch_size * world_size):
                 prog_bar.update()
     
-    bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir=os.path.join(save_path, '.dist_test'))
-    if have_mask:
-        mask_results = collect_results_cpu(mask_results, len(dataset), tmpdir=os.path.join(save_path, '.dist_test'))
-    else:
-        mask_results = None
+    synchronize()
+    len_dataset = len(dataset)
+    all_pred_results = sum(map(list, zip(*all_gather_object(all_pred_results))),[])[:len_dataset]
+    all_img_metas = sum(map(list, zip(*all_gather_object(all_img_metas))),[])[:len_dataset]
     
-    det_results = bbox_results if mask_results is None else {'bbox_results': bbox_results, 'mask_results': mask_results}
-    
-    key_score = {}
-    if rank == 0:
-        eval_kwargs = bev_cfg.get('evaluation', {}).copy()
-        for key in [
-                'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                'rule'
-        ]:
-            eval_kwargs.pop(key, None)
-        eval_kwargs['jsonfile_prefix'] = os.path.join(save_path, det_res_path)
-        eval_results = dataset.evaluate(det_results, **eval_kwargs)
-        for metric, score in eval_results.items():
-            if 'mAP' in  metric or 'NDS' in metric:
-                key_score[metric] = score
-    return key_score       
-  
+    # if get_rank() == 0:
+    #     evaluator.evaluate(all_pred_results, all_img_metas)
+    metrics = {}
+    if get_rank() == 0:
+        metrics = evaluator.evaluate(all_pred_results, all_img_metas)
+        if metrics is None:
+            metrics = {}
+    synchronize()
+    return metrics
 
 if __name__ == "__main__":
     test()

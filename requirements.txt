@@ -110,10 +110,6 @@ mccabe==0.7.0
 mdurl==0.1.2
 mistune==3.1.4
 mmcls==0.25.0
-mmcv-full==1.6.0
-mmdet==2.25.2
--e git+https://github.com/HyelinJo312/BEVDiffDepth.git@c787d7ea6b764b78244f9fd1eb4ae6800804954c#egg=mmdet3d&subdirectory=BEVDepth/mmdetection3d
-mmsegmentation==0.28.0
 model-index==0.1.11
 multidict==6.1.0
 multiprocess==0.70.16
@@ -178,7 +174,6 @@ pyquaternion==0.9.9
 pytest==8.3.5
 python-dateutil==2.8.2
 python-json-logger==4.0.0
-pytorch-lightning==1.6.0
 pytz==2023.3.post1
 PyWavelets==1.4.1
 PyYAML==6.0.1
@@ -220,10 +215,7 @@ tinycss2==1.2.1
 tokenizers==0.20.3
 tomli==2.3.0
 tomlkit==0.13.3
-torch==1.10.0+cu111
-torchaudio==0.10.0+rocm4.1
 torchmetrics==0.11.4
-torchvision==0.11.1+cu111
 tornado==6.4.2
 tqdm==4.67.1
 traitlets==5.14.3

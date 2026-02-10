@@ -43,7 +43,6 @@ from packaging import version
 from torchvision import transforms
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
-# from diffusers.training_utils import EMAModel
 
 from mmcv import Config, DictAction
 from torch.utils.data.distributed import DistributedSampler
@@ -52,7 +51,6 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,save_checkpoi
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))+"/..")
-# from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 # from bevdepth.datasets.nusc_det_dataset_v2 import NuscDetDataset, collate_fn
 from bevdepth.projects.utils.data_utils import CustomNuScenesDiffusionDataset, collate_fn, DistributedGroupSampler
 from mmdet.apis import set_random_seed
@@ -61,10 +59,11 @@ from bevdepth.projects.layout_diffusion.layout_diffusion_unet import LayoutDiffu
 from bevdepth.projects.ldm.modules.diffusionmodules.openaimodel import UNetModel
 from bevdepth.projects.utils.scheduler_utils import DDIMGuidedScheduler
 from bevdepth.projects.utils.model_utils import get_bev_model, build_unet, instantiate_from_config, get_bevdepth_model
-from bevdepth.projects.test_bev_diffuser_dino_v2 import evaluate
+from bevdepth.projects.test_bev_diffuser_dino_v2_seg import evaluate
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import MultiStepLR
 from bevdepth.projects.fm_feature import GetDINOV2Feat
+from bevdepth.projects.layout_diffusion.diffusion_unet_v2_seg import SPADEResBlock, ResBlock, Downsample, Upsample
+from bevdepth.projects.ldm.modules.attention import SpatialTransformer
 
 
 # logger = get_logger(__name__, log_level="INFO")
@@ -117,6 +116,7 @@ def train():
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
         
+        
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -155,11 +155,29 @@ def train():
     # unet = build_unet(bev_cfg.unet)
     if args.pretrained_unet_checkpoint is not None and (os.path.isfile(args.pretrained_unet_checkpoint) or os.path.isdir(args.pretrained_unet_checkpoint)):
         unet.from_pretrained(args.pretrained_unet_checkpoint, subfolder="unet")
+        print(f"Successfully loaded pretrained unet from {args.pretrained_unet_checkpoint}")
+
         unet.requires_grad_(True)
-        # # train only the downsample and upsample layers
-        # unet.requires_grad_(False)
-        # unet.downsample_blocks.requires_grad_(True)
-        # unet.upsample_blocks.requires_grad_(True)
+        # Freeze specific backbone components
+        unet.time_embed.requires_grad_(False)
+        unet.input_blocks[0].requires_grad_(False)  # Freeze First Input Convolution
+        unet.downsample_blocks.requires_grad_(False)
+        unet.upsample_blocks.requires_grad_(False)   
+        
+        frozen_count = 0
+        for name, module in unet.named_modules():
+            # output_blocks는 전체 unfreeze (SPADEResBlock + ResBlock 모두)
+            if 'output_blocks' in name:
+                continue  # output_blocks는 trainable 유지
+            if isinstance(module, ResBlock):
+                if not isinstance(module, SPADEResBlock):
+                    module.requires_grad_(False)
+                    frozen_count += 1
+        # Print trainable status
+        trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in unet.parameters())
+        print(f"Frozen {frozen_count} backbone blocks (ResBlock in input_blocks/middle_block).")
+        print(f"Trainable parameters: {trainable_params} / {all_params} ({trainable_params/all_params:.2%})")
 
     assert version.parse(accelerate.__version__) >= version.parse("0.16.0"), "accelerate 0.16.0 or above is required"
 
@@ -182,36 +200,32 @@ def train():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    
+
+    optimizer_cls = torch.optim.AdamW
+
     trained_params = list(unet.parameters())
     if args.task_loss_scale != 0:
         trained_params += list(bev_model.parameters())
-        
-    # learning_rate = args.learning_rate
-    # Configure optimizer and scheduler to match base_exp.py
-    basic_lr_per_img = 2e-4 / 64
-    learning_rate = basic_lr_per_img * args.train_batch_size * accelerator.num_processes
-        
-    optimizer = torch.optim.AdamW(
+    
+    learning_rate = args.learning_rate
+
+    optimizer = optimizer_cls(
         trained_params,
         lr=learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=1e-7,
+        weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
-    )
-    
-    # lr_scheduler = get_scheduler(
-    #     args.lr_scheduler,
-    #     optimizer=optimizer,
-    #     # num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-    #     # num_training_steps=args.max_train_steps * accelerator.num_processes,
-    #     num_warmup_steps=args.lr_warmup_steps,
-    #     num_training_steps=args.max_train_steps,
-    #     # power=1.5
-    # )
+)
 
-    milestones = [15000, 20000]
-    lr_scheduler = MultiStepLR(optimizer, milestones=milestones)
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        # num_warmup_steps=args.lr_warmup_steps,
+        # num_training_steps=args.max_train_steps,
+    )
+
 
     with accelerator.main_process_first():
         train_dataset = CustomNuScenesDiffusionDataset(bev_cfg.data.train)
@@ -220,11 +234,6 @@ def train():
         # val_dataset = NuscDetDataset(bev_cfg.data.val)
 
     if accelerator.num_processes > 1:
-        # train_sampler = DistributedGroupSampler(
-        #     dataset=train_dataset,
-        #     samples_per_gpu=bev_cfg.data.batch_size_per_device,
-        #     num_replicas=accelerator.num_processes,
-        #     rank=accelerator.process_index)
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=accelerator.num_processes,
@@ -245,58 +254,28 @@ def train():
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=True,
-        shuffle=False,
+        shuffle=(train_sampler is None),
+        pin_memory=True,
         persistent_workers=True,
-        # prefetch_factor=1,
         collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth,
-                            has_depth_any=True, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+                            has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
         # collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, has_depth_any=True),
         sampler=train_sampler,
     )    
-    
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=False,
+        persistent_workers=True,
         collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, 
-                           has_depth_any=True, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+                           has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
         # collate_fn=partial(collate_fn, is_return_depth=bev_cfg.use_fusion, has_depth_any=True),
         sampler=val_sampler,
     )
     
-    def get_condition(gt_layout):
-        cond = {}
-        def B(x, dim):
-            return x.unsqueeze(0) if x.dim() == dim else x
-
-        if 'layout_obj_classes' in gt_layout:
-            cond['obj_class'] = B(gt_layout['layout_obj_classes'], 1).long()
-        if 'layout_obj_bboxes' in gt_layout:
-            cond['obj_bbox'] = B(gt_layout['layout_obj_bboxes'], 2).float()
-        if 'layout_obj_is_valid' in gt_layout:
-            cond['is_valid_obj'] = B(gt_layout['layout_obj_is_valid'], 1).float()
-        if 'layout_obj_names' in gt_layout:
-            cond['obj_name'] = B(gt_layout['layout_obj_names'], 2).float()
-
-        if np.random.rand() < args.uncond_prob:
-            if isinstance(unet.module, LayoutDiffusionUNetModel):
-                if 'obj_class' in unet.module.layout_encoder.used_condition_types and 'obj_class' in cond:
-                    cond['obj_class'].fill_(unet.module.layout_encoder.num_classes_for_layout_object - 1)
-                    cond['obj_class'][:, 0] = unet.module.layout_encoder.num_classes_for_layout_object - 2
-                if 'obj_name' in unet.module.layout_encoder.used_condition_types:
-                    cond['obj_name'] = B(gt_layout['default_obj_names'], 2).float()
-                if 'obj_bbox' in unet.module.layout_encoder.used_condition_types and 'obj_bbox' in cond:
-                    cond['obj_bbox'].zero_()
-                    cond['obj_bbox'][:, 0] = cond['obj_bbox'].new_tensor(
-                        [0, 0, 0, 1, 1, 1, 0, 0, 0]
-                        if unet.module.layout_encoder.use_3d_bbox else [0, 0, 1, 1])
-                cond['is_valid_obj'].zero_()
-                cond['is_valid_obj'][:, 0] = 1.0
-        return cond
-
-    def get_dino_cond(dino_out):
-        if np.random.rand() < args.uncond_prob:
+    def get_dino_cond(rand_prob, dino_out):
+        if rand_prob < args.uncond_prob:
             uncond = {k: v.clone() if isinstance(v, torch.Tensor) else v
                         for k, v in dino_out.items()}
             last_cls_u = torch.zeros_like(dino_out['last_cls'])  # (B,V,C_in)
@@ -307,22 +286,31 @@ def train():
         else:
             cond = dino_out
         return cond
-
-    def get_task_loss_scale(global_step, ramp_cfg, default_scale):
-        scale = 0.0
-        for step_th, s in ramp_cfg:
-            if global_step >= step_th:
-                scale = s
-            else:
-                break
-        return scale * default_scale
+           
+    def get_segmaps_cond(rand_prob, segmaps):
+        if rand_prob < args.uncond_prob_seg:
+            cond = torch.zeros_like(segmaps)
+        else:
+            cond = segmaps
+        return cond
+        
+    def resize_segmaps(cfg, segmaps):
+        out_h, out_w = cfg.final_dim 
+        
+        segmaps = segmaps.unsqueeze(2).float() # (B, V, 1, H, W)
+      
+        segmaps_resized = F.interpolate(     # (B, V, 1, out_h, out_w)
+            segmaps,
+            size=(out_h, out_w),
+            mode="nearest",
+        )
+        segmaps_resized = segmaps_resized.squeeze(1).to(torch.int16)   # (V, out_h, out_w)
+        return segmaps_resized
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-
-    unet, optimizer, lr_scheduler = accelerator.prepare(
-        unet, optimizer, lr_scheduler
-    )
+    
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
 
     weight_dtype = torch.float32
 
@@ -330,7 +318,7 @@ def train():
     bev_model.to(accelerator.device, dtype=weight_dtype)
     
     # Get DINOv2 feature extractor
-    get_dino = GetDINOV2Feat(device=accelerator.device)
+    get_dino = GetDINOV2Feat()
 
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -432,10 +420,11 @@ def train():
                 continue
 
             with accelerator.accumulate(unet):
-                (sweep_imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_anything) = batch
+                (sweep_imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_maps, segmaps) = batch
                 
                 # Depth Anything
-                sweep_depth = depth_anything.to(device=device) 
+                sweep_depth = depth_maps.to(device=device) 
+                segmaps = segmaps.to(device=device)
        
                 # if len(depth_labels.shape) == 5:
                 #     lidar_depth = depth_labels[:, 0, ...].to(device=device, non_blocking=True)
@@ -447,15 +436,15 @@ def train():
                     gt_labels = [gt_label.to(device=device) for gt_label in gt_labels]
 
                 # DINO   
+                rand_prob = np.random.rand()
                 dino_out = get_dino(sweep_imgs, img_metas)
-                dino_cond = get_dino_cond(dino_out)
+                dino_cond = get_dino_cond(rand_prob, dino_out)
+                seg_cond = get_segmaps_cond(rand_prob, segmaps)
                 # layout_cond = get_condition(gt_layout)
                 
                 # Get BEV
                 with torch.no_grad():
                     latents = bev_model(sweep_imgs, sweep_depth, mats, img_metas, only_bev=True, dino_out=dino_out).detach()
-                # latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
-                # latents = latents.permute(0, 3, 1, 2).contiguous()
                 latents = latents.contiguous()
 
                 # Sample noise that we'll add to the latents
@@ -481,27 +470,20 @@ def train():
                 
                 # Predict the noise residual and compute loss
                 # model_pred = unet(noisy_latents, timesteps, mats, dino_cond, **layout_cond)[0]
-                model_pred = unet(noisy_latents, timesteps, mats, dino_cond)[0]
+                model_pred = unet(noisy_latents, timesteps, mats, dino_cond, seg_cond, sweep_depth)[0]
 
                 denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample" and global_step > step_threshold:
-                if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
-                    task_loss = get_task_loss(model_pred, sweep_imgs, sweep_depth, mats, img_metas, gt_boxes, gt_labels)
-                else:
-                    task_loss = 0
-                    
+                # # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample" and global_step > step_threshold:
                 # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
-                #     task_loss_scale = get_task_loss_scale(global_step, task_loss_ramp, args.task_loss_scale)
-                #     if task_loss_scale > 0:
-                #         task_loss = get_task_loss(model_pred, sweep_imgs, sweep_depth, mats, img_metas, gt_boxes, gt_labels)
+                #     task_loss = get_task_loss(model_pred, sweep_imgs, sweep_depth, mats, img_metas, gt_boxes, gt_labels)
                 # else:
-                #     task_loss = 0.0
+                #     task_loss = 0
                     
-                total_loss = args.diffusion_loss_scale * denoise_loss + args.task_loss_scale * task_loss
-                # total_loss = args.diffusion_loss_scale * denoise_loss + task_loss_scale * task_loss
+                # total_loss = args.diffusion_loss_scale * denoise_loss + args.task_loss_scale * task_loss
+                total_loss = args.diffusion_loss_scale * denoise_loss
 
-                # get learning rate
+                # get learing rate
                 lr = lr_scheduler.get_last_lr()[0]
 
                 step_cnt += 1
@@ -511,8 +493,7 @@ def train():
                     "step/epoch": epoch,
                     "lr/learning_rate" : lr,
                     "train/denoise_loss": denoise_loss,
-                    "train/task_loss": task_loss,
-                    # "train/scaled_task_loss": task_loss_scale * task_loss,
+                    # "train/task_loss": task_loss,
                     "train/total_loss": total_loss,
                 }
 
@@ -548,7 +529,7 @@ def train():
                 train_loss = 0.0
 
                 # save checkpoint 
-                if global_step % args.checkpointing_steps == 0 and global_step in [50000, 100000, 200000]:
+                if global_step % args.checkpointing_steps == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -611,7 +592,7 @@ def train():
                                 tb_writer.add_scalar(f"val/{metric}", score, global_step=step_cnt)
                     unet.train()                         
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch":epoch}
+            logs = {"denoise_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch":epoch}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -701,6 +682,13 @@ def parse_args():
     
     parser.add_argument(
         "--uncond_prob", 
+        default=0.2, 
+        type=float, 
+        help="The probability of replacing caption with empty string."
+    )
+    
+    parser.add_argument(
+        "--uncond_prob_seg", 
         default=0.2, 
         type=float, 
         help="The probability of replacing caption with empty string."
@@ -863,11 +851,11 @@ def parse_args():
         default=None
     )
     
-    # parser.add_argument(
-    #     "--depth_dir",
-    #     type=str,
-    #     default=None
-    # )
+    parser.add_argument(
+        "--depth_dir",
+        type=str,
+        default=None
+    )
 
     parser.add_argument(
         "--semantic_dir",
@@ -882,12 +870,10 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--enable_task_loss",
-        type=int,
-        default=30000,
-        help=("Enable task loss after certain steps."),
+        "--training_phase",
+        type=str,
+        default=None
     )
-    
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:

@@ -19,6 +19,12 @@ from bevdepth.projects.fm_feature import GetDINOV2Feat
 __all__ = ['DINOLSSFPN']
 
 
+def load_pca(path):
+    data = np.load(path)
+    mu = torch.from_numpy(data["mu"])      # (C_IN,)
+    P = torch.from_numpy(data["P"])         # (C_REDUCED, C_IN)
+    return mu, P
+
 class DINOLSSFPN(nn.Module):
 
     def __init__(self,
@@ -76,13 +82,15 @@ class DINOLSSFPN(nn.Module):
         # self.img_backbone = build_backbone(img_backbone_conf)
         # self.img_neck = build_neck(img_neck_conf)
         # self.depth_net = self._configure_depth_net(depth_net_conf)
-
         # self.img_neck.init_weights()
         # self.img_backbone.init_weights()
         
         self.use_da = use_da
-        # self.dino = GetDINOV2Feat()
-
+        self.mu, self.P = load_pca(f"../../pca_ckpts/pca_sckit_768_to_{str(self.output_channels)}.npz")
+        
+        d_min, d_max, d_step = self.d_bound
+        D_from_bound = int((d_max - d_min) / d_step)
+        assert self.depth_channels == D_from_bound, (self.depth_channels, D_from_bound)
 
     def _downsample_lidar_depth_bv(self, lidar_depth):
         """
@@ -129,13 +137,6 @@ class DINOLSSFPN(nn.Module):
         return depth_min, valid_mask, h, w
     
     def get_lidar_depth_one_hot(self, lidar_depth):
-        """
-        Input:
-            lidar_depth: [B, V, H, W]  # 6-view LiDAR depth, 0 = invalid
-
-        Output:
-            depth_one_hot: [B*V, D, h, w]
-        """
         B, V, H, W = lidar_depth.shape
         ds = self.downsample_factor
         D = self.depth_channels  # depth_channels = number of depth bins
@@ -184,47 +185,7 @@ class DINOLSSFPN(nn.Module):
 
         depth_one_hot = gt_depths_one_hot.permute(0, 3, 1, 2).contiguous()
         return depth_one_hot.float()
-    
-    def get_lidar_depth_soft_one_hot(self, lidar_depth):
-        """
-        Input:
-            lidar_depth: [B, V, H, W]
-        Output:
-            depth_soft: [B*V, D, h, w]
-        """
-        B, V, H, W = lidar_depth.shape
-        depth_min, valid_mask, h, w = self._downsample_lidar_depth_bv(lidar_depth)
-        D = self.depth_channels
-        d_min, d_max, d_interval = self.d_bound
-        device = lidar_depth.device
-        dtype = depth_min.dtype
-
-        pos = (depth_min - d_min) / d_interval    # [B*V, h, w], 실수
-        pos = pos.clamp(0.0, float(D - 1e-6))
-
-        lower = torch.floor(pos).long()           # [B*V, h, w]  in [0, D-1]
-        upper = torch.clamp(lower + 1, max=D - 1)
-
-        w_upper = (pos - lower.to(pos.dtype)).clamp(0.0, 1.0)
-        w_lower = 1.0 - w_upper
-
-        # invalid / 범위 밖 depth는 weight 0
-        w_lower = w_lower * valid_mask
-        w_upper = w_upper * valid_mask
-
-        depth_soft = torch.zeros(B * V, D, h, w, device=device, dtype=dtype)
-
-        # (B*V, 1, h, w)
-        lower_idx = lower.unsqueeze(1)
-        upper_idx = upper.unsqueeze(1)
-        w_lower_exp = w_lower.unsqueeze(1)
-        w_upper_exp = w_upper.unsqueeze(1)
-
-        depth_soft.scatter_add_(1, lower_idx, w_lower_exp)
-        depth_soft.scatter_add_(1, upper_idx, w_upper_exp)
-
-        return depth_soft.float()
-
+   
     def get_lidar_depth_gaussian(self, lidar_depth, sigma=None, eps=1e-6):
         """
         Input:
@@ -283,7 +244,6 @@ class DINOLSSFPN(nn.Module):
             gauss / norm_factor,
             torch.zeros_like(gauss),
         )
-
         return gauss  # [B*V, D, h, w]
 
 
@@ -357,13 +317,6 @@ class DINOLSSFPN(nn.Module):
             points = points.squeeze(-1)
         return points[..., :3]
 
-
-    def load_pca(self, path, device):
-        data = np.load(path)
-        mu = torch.from_numpy(data["mu"]).to(device)        # (C_IN,)
-        P = torch.from_numpy(data["P"]).to(device)          # (C_REDUCED, C_IN)
-        return mu, P
-
     def apply_pca(self, feats, mu, P):
         """
         feats: (..., C_IN)
@@ -385,32 +338,145 @@ class DINOLSSFPN(nn.Module):
         return x_reduced
 
 
-    # def get_cam_feats(self, imgs, img_metas):
-    #     """Get feature maps from images."""
-    #     batch_size, num_sweeps, num_cams, num_channels, imH, imW = imgs.shape  # [B, N, V, C, H, W]
-
-    #     # imgs = imgs.flatten().view(batch_size * num_sweeps * num_cams,
-    #     #                            num_channels, imH, imW)
-    #     # img_feats = self.img_neck(self.img_backbone(imgs))[0]  # PCA 해서 가져와야함 
-    #     dino_output = self.dino(imgs, img_metas)
-    #     img_feats = dino_output['last_tokens'] # [B, V, N, C]
-    #     patch_hw = dino_output['patch_hw'] # (H2/14, W2/14)  (35, 58)
+    def depth_to_bev_bin(self, depth, d_bound, sigma=1.0, eps=1e-8):
+        """
+        depth: (..., H, W)  or (..., ) whatever, but we'll assume depth is (..., h, w)
+        return: (..., h, w, D)
+        """
+        d_min, d_max, d_step = d_bound
+        D = int((d_max - d_min) / d_step)
+        valid = torch.isfinite(depth) & (depth >= d_min) & (depth < d_max)
         
-    #     # img_feats = img_feats.reshape(batch_size*num_sweeps, num_cams, img_feats.shape[-1], patch_hw[0], patch_hw[1])  # [B*N, V, C, H2/14, W2/14]
+        depth = depth.clamp(d_min, d_max - 1e-6)
+        depth_idx = (depth - d_min) / d_step  # same shape as depth
 
-    #     return img_feats, patch_hw  # [B, V, N, C]  N=35*58
+        bins = torch.arange(D, device=depth.device, dtype=depth_idx.dtype)
+        bins = bins.view(*([1] * depth.ndim), D)  # (1,...,1,D) with correct rank
+
+        diff = bins - depth_idx.unsqueeze(-1)     # (..., h, w, D)
+        prob = torch.exp(-(diff ** 2) / (2 * sigma ** 2))
+        prob = prob * valid.unsqueeze(-1).to(prob.dtype)
+        prob = prob / (prob.sum(dim=-1, keepdim=True) + eps)
+        return prob
 
 
+    def downsample_depth(self, depth):
+        assert depth.dim() == 4, f"Expected [B,V,H,W], got {depth.shape}"
+        B, V, H, W = depth.shape
+        ds = self.downsample_factor
+        assert H % ds == 0 and W % ds == 0, f"H,W must be divisible by ds={ds}, got {(H,W)}"
+
+        # NaN/inf 방어 (DepthAnything에서 종종 발생)
+        d_min, d_max, _ = self.d_bound
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # [B,V,H,W] -> [B*V,H,W]
+        depth = depth.view(B * V, H, W)
+
+        # [B*V,H,W] -> [B*V,h,ds,w,ds,1]
+        h, w = H // ds, W // ds
+        depth = depth.view(B * V, h, ds, w, ds, 1)
+
+        # [B*V,h,ds,w,ds,1] -> [B*V,h,w,1,ds,ds]
+        depth = depth.permute(0, 1, 3, 5, 2, 4).contiguous()
+
+        # [B*V*h*w, ds*ds]
+        depth = depth.view(-1, ds * ds)
+
+        # valid: depth > 0 
+        valid = depth > 0.0
+
+        depth_tmp = torch.where(valid, depth, depth.new_full(depth.shape, 1e5))
+        depth_min = depth_tmp.min(dim=-1).values  # [B*V*h*w]
+
+        depth_min = depth_min.view(B * V, h, w)   # [B*V,h,w]
+        valid_mask = depth_min < 1e5              # patch에 valid가 하나라도 있었으면 True
+
+        return depth_min, valid_mask, h, w
+
+
+    def depth_to_onehot(
+        self,
+        depth_min,        # [B*V, h, w]  (meter)
+        valid_mask,       # [B*V, h, w]  (bool)
+        eps=1e-6,
+        use_half_bin=True,
+    ):
+        """
+        Return:
+            depth_prob: [B*V, D, h, w]  one-hot (Dirac) distribution
+        """
+        d_min, d_max, d_step = self.d_bound
+        D = self.depth_channels  # must match frustum D
+
+        depth = depth_min.to(torch.float32)
+
+        # in-range validity
+        in_range = (depth >= d_min) & (depth < d_max) & torch.isfinite(depth)
+        valid = valid_mask & in_range
+
+        # compute bin centers convention
+        idx = torch.round((depth - d_min) / d_step).long()
+
+        # clamp and mask invalid
+        idx = idx.clamp(0, D - 1)
+        idx = torch.where(valid, idx, idx.new_zeros(idx.shape))  # dummy index for invalid
+
+        # one-hot: [B*V,h,w,D] then permute to [B*V,D,h,w]
+        one_hot = F.one_hot(idx, num_classes=D).to(depth.dtype)  # [B*V,h,w,D]
+        depth_prob = one_hot.permute(0, 3, 1, 2).contiguous()    # [B*V,D,h,w]
+
+        # invalid -> all zeros
+        depth_prob = depth_prob * valid.unsqueeze(1).to(depth_prob.dtype)
+        return depth_prob
+
+    def get_downsampled_gt_depth(self, gt_depths):
+        """
+        Input:
+            gt_depths: [B, V, H, W] (LiDAR)
+        Output:
+            gt_depths: [B*N*h*w, d]
+        """
+        B, N, H, W = gt_depths.shape
+        gt_depths = gt_depths.contiguous().view(
+            B * N,
+            H // self.downsample_factor,
+            self.downsample_factor,
+            W // self.downsample_factor,
+            self.downsample_factor,
+            1,
+        )
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(
+            -1, self.downsample_factor * self.downsample_factor)
+        gt_depths_tmp = torch.where(gt_depths == 0.0,
+                                    1e5 * torch.ones_like(gt_depths),
+                                    gt_depths)
+        gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+        gt_depths = gt_depths.view(B * N, H // self.downsample_factor,
+                                   W // self.downsample_factor)
+
+        gt_depths = (gt_depths -
+                     (self.d_bound[0] - self.d_bound[2])) / self.d_bound[2] 
+        gt_depths = torch.where(
+            (gt_depths < self.depth_channels + 1) & (gt_depths >= 0.0),
+            gt_depths, torch.zeros_like(gt_depths))
+        gt_depths = F.one_hot(gt_depths.long(),
+                              num_classes=self.depth_channels + 1)
+        gt_depths = gt_depths[..., 1:]
+        gt_depths = gt_depths.permute(0, 3, 1, 2).contiguous()
+        return gt_depths.float()
 
     def _forward_single_sweep(self,
                               sweep_index,
                               sweep_imgs,
-                              lidar_depth,
+                              sweep_depth,
                               mats_dict,
                               img_metas,
                               is_return_depth=False,
                               only_bev=True,
-                              dino_out=None):
+                              dino_feats=None,
+                              dino_patch_size=None):
         """Forward function for single sweep.
 
         Args:
@@ -436,30 +502,31 @@ class DINOLSSFPN(nn.Module):
             Tensor: BEV feature map.
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, img_width = sweep_imgs.shape
-        # img_feats, patch_hw = self.get_cam_feats(sweep_imgs, img_metas)   # [B, V, N, C]
-        img_feats = dino_out['last_tokens'] # [B, V, N, C]
-        patch_hw = dino_out['patch_hw'] # (H2/14, W2/14)  (35, 58)
+        img_feats = dino_feats[:, 0, ...].permute(0, 1, 3, 4, 2).contiguous()  # (B,V,H,W,C)
+        patch_hw = dino_patch_size # (H2/14, W2/14)  (35, 58)
+        raw_depth = sweep_depth[:, 0, ...]  # (B,V,H,W)
 
-        # get PCA 
-        mu, P = self.load_pca("BEVDepth/pca_ckpts/pca_sckit_768_to_256.npz", device='cuda')
-        source_features = self.apply_pca(img_feats, mu, P)  # (B, V, N, 128) N=35*58
-        source_features = source_features.reshape(batch_size*num_cams, source_features.shape[-1], patch_hw[0], patch_hw[1])  # [B*V, C, H2/14, W2/14] (6, 128, 35, 58)
+        # DINO channel reduction with PCA
+        self.mu, self.P = self.mu.to(img_feats.device), self.P.to(img_feats.device)
+        source_features = self.apply_pca(img_feats, self.mu, self.P)  # (B, V, N, 128) N=35*58
+        source_features = source_features.reshape(batch_size*num_cams, source_features.shape[-1], 
+                                                  patch_hw[0], patch_hw[1])  # [B*V, C, H2/14, W2/14] (6, 128, 32, 57)
         
-        # depth = depth_feature[:, :self.depth_channels].softmax(   # [6, 112, 16, 44] -> [B*V, D, H, W]
-        #     dim=1, dtype=depth_feature.dtype)
+        # down_depth, valid_mask, h, w = self.downsample_depth(raw_depth)   # [B*V,h,w]
+
+        # # depth = self.depth_to_onehot(down_depth, valid_mask, use_half_bin=False)  # [B*V, D, h, w]
         
-        depth = lidar_depth # [B, V, H, W]
-        
-        if self.use_soft_depth:
-            depth = self.get_lidar_depth_gaussian(lidar_depth)  # (B*V, D, H, W)
-        else:
-            depth = self.get_lidar_depth_one_hot(lidar_depth)   # (B*V, D, H, W)
+        # depth_prob = self.depth_to_bev_bin(down_depth, self.d_bound, sigma=2.0)     # [B*V,h,w,D]
+        # depth_prob = depth_prob * valid_mask.unsqueeze(-1)  # invalid patch -> all zeros
+        # depth = depth_prob.permute(0, 3, 1, 2).contiguous()                         # [B*V,D,h,w] (6, 112, 32, 57)
+
+        depth = self.get_downsampled_gt_depth(raw_depth)  # [B*V, D, h, w]
         
         geom_xyz = self.get_geometry(
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],
             mats_dict['intrin_mats'][:, sweep_index, ...],
-            mats_dict['ida_mats'][:, sweep_index, ...],
-            mats_dict.get('bda_mat', None),
+            mats_dict['ida_mats'][:, sweep_index, ...],  # if None, identity matrix
+            mats_dict.get('bda_mat', None),              # if None, identity matrix
         )
         geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
                     self.voxel_size).int()
@@ -470,7 +537,7 @@ class DINOLSSFPN(nn.Module):
 
             img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)  # [6, 80, 112, 16, 44]
 
-            img_feat_with_depth = img_feat_with_depth.reshape(   # [1, 6, 80, 112, 16, 44]
+            img_feat_with_depth = img_feat_with_depth.reshape(   # [1, 6, 128, 112, 16, 44]
                 batch_size,
                 num_cams,
                 img_feat_with_depth.shape[1],
@@ -479,9 +546,9 @@ class DINOLSSFPN(nn.Module):
                 img_feat_with_depth.shape[4],
             )
 
-            img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)    # [1, 6, 112, 16, 44, 80]
-
-            feature_map = voxel_pooling_train(geom_xyz,              # feature_map = [1, 80, 128, 128]
+            img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)   
+            
+            feature_map = voxel_pooling_train(geom_xyz,              # feature_map = [1, 128, 128, 128]
                                               img_feat_with_depth.contiguous(),
                                               self.voxel_num.cuda())
         elif only_bev:
@@ -501,7 +568,7 @@ class DINOLSSFPN(nn.Module):
 
     def forward(self,
                 sweep_imgs,
-                lidar_depth, 
+                sweep_depth, 
                 mats_dict,
                 img_metas,
                 timestamps=None,
@@ -537,11 +604,13 @@ class DINOLSSFPN(nn.Module):
         key_frame_res = self._forward_single_sweep(
             0,
             sweep_imgs[:, 0:1, ...],
-            lidar_depth,    
+            sweep_depth[:, 0:1, ...],    
             mats_dict,
             img_metas,
             is_return_depth=is_return_depth,
-            only_bev=only_bev, dino_out=dino_out)
+            only_bev=only_bev, 
+            dino_feats=dino_out['last_tokens'][:, 0:1, ...],
+            dino_patch_size=dino_out['patch_hw'])
         if num_sweeps == 1:
             return key_frame_res
 
@@ -554,11 +623,12 @@ class DINOLSSFPN(nn.Module):
                 feature_map = self._forward_single_sweep(
                     sweep_index,
                     sweep_imgs[:, sweep_index:sweep_index + 1, ...],
-                    lidar_depth,
+                    sweep_depth[:, sweep_index:sweep_index + 1, ...],
                     mats_dict,
                     img_metas,
                     is_return_depth=is_return_depth, 
-                    only_bev=only_bev, dino_out=dino_out)
+                    only_bev=only_bev, dino_feats=dino_out['last_tokens'][:, sweep_index:sweep_index + 1, ...],
+                    dino_patch_size=dino_out['patch_hw'])
                 ret_feature_list.append(feature_map)
 
         if is_return_depth:

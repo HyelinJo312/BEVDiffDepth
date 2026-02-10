@@ -170,6 +170,11 @@ class GetDINOv2Cond(nn.Module):
         }
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel
+
 class GetDINOV2Feat(nn.Module):
     def __init__(
         self,
@@ -185,6 +190,7 @@ class GetDINOV2Feat(nn.Module):
         self.symmetric_pad = symmetric_pad
 
         # DINOv2 backbone
+        # (encoder 인자는 현재 checkpoint 선택에 반영되어 있지 않음: 필요하면 분기 추가)
         self.model = AutoModel.from_pretrained('facebook/dinov2-base').to(self.device)
         self.model.requires_grad_(False)
         for p in self.model.parameters():
@@ -229,10 +235,10 @@ class GetDINOV2Feat(nn.Module):
         x = x.to(self.device, non_blocking=True)
 
         extra_geom = {
-            'scale': scale,                
-            'H2W2': (H2, W2),              
-            'padding': (top, left),        
-            'patch_size': self.patch,      # 14
+            'scale': scale,
+            'H2W2': (H2, W2),
+            'padding': (top, left),
+            'patch_size': self.patch,
         }
 
         Hp, Wp = H2 // self.patch, W2 // self.patch
@@ -240,48 +246,55 @@ class GetDINOV2Feat(nn.Module):
 
     def forward(self, images, img_metas, n_layers=4):
         """
-        images: (B, N, V, C, H, W) 
+        images: (B, N, V, C, H, W)
+        Return last_cls:    (B, N, V, C_dino)
+               last_tokens: (B, N, V, Hp*Wp, C_dino)
         """
         if not isinstance(images, torch.Tensor):
             raise TypeError("images must be a torch.Tensor")
-        
-        B, V, C, H, W = images.shape
-        # TODO: sweep img가 들어오면 Key frame과 나머지 구분하도록 코드 수정 필요
-        x = images.reshape(B * V, C, H, W).contiguous()
-    
-        # aspect ratio 
-        x, Hp, Wp, extra_geom = self.image_preprocess(x)  # x: (B*V, 3, H2, W2)
+        if images.ndim != 6:
+            raise ValueError(f"Expected images.ndim==6, got {images.ndim}, shape={tuple(images.shape)}")
+
+        B, N, V, C, H, W = images.shape
+        if C != 3:
+            raise ValueError(f"Expected C==3, got C={C}")
+
+        # (B,N,V,C,H,W) -> (B*N*V,C,H,W)
+        x = images.reshape(B * N * V, C, H, W).contiguous()
+
+        # pad/patch align
+        x, Hp, Wp, extra_geom = self.image_preprocess(x)  # (B*N*V, 3, H2, W2)
 
         # Dinov2 forward
         with torch.no_grad():
             outputs = self.model(pixel_values=x, output_hidden_states=True)
         hidden_states = outputs.hidden_states
-        hs_selected = hidden_states[-n_layers:] if n_layers > 0 else [hidden_states[-1]]
-
+        hs_selected = hidden_states[-n_layers:] if (n_layers is not None and n_layers > 0) else [hidden_states[-1]]
+        
         feats_out = []
         cls_out = []
         for h in hs_selected:
-            # h: (B*V, 1+N, C_dino)
-            cls_tok = h[:, 0]          # (B*V, C_dino)
-            tok    = h[:, 1:]          # (B*V, Hp*Wp, C_dino)
+            # h: (B*N*V, 1+Hp*Wp, C_dino)
+            cls_tok = h[:, 0]          # (B*N*V, C_dino)
+            tok     = h[:, 1:]         # (B*N*V, Hp*Wp, C_dino)
 
-            cls_tok = cls_tok.view(B, V, self.hidden_dim)               # (B, V, C)
-            tok_seq = tok.view(B, V, Hp * Wp, self.hidden_dim)          # (B, V, N, C)
-            feats_out.append(tok_seq)
+            cls_tok = cls_tok.view(B, N, V, self.hidden_dim)                 # (B,N,V,C)
+            tok_hw  = tok.view(B, N, V, self.hidden_dim, Hp, Wp)             # (B,N,V,Hp,Wp,C)
+
+            feats_out.append(tok_hw)
             cls_out.append(cls_tok)
 
-        last_tok, last_cls = feats_out[-1], cls_out[-1]
+        last_tokens, last_cls = feats_out[-1], cls_out[-1]
 
         return {
             'feature_type': 'dinov2',
-            # 'features': feats_out,        # list[(B,V,N,C)]
-            'patch_hw': (Hp, Wp),           # (H2/14, W2/14)  (35, 58)
-            'last_cls': last_cls,           # (B, V, C)
-            'last_tokens': last_tok,        # (B, V, N, C) 
+            # 'features': feats_out,          # list[(B,N,V,Hp,Wp,C)]
+            'patch_hw': (Hp, Wp),
+            'last_cls': last_cls,             # (B,N,V,C)
+            'last_tokens': last_tokens,       # (B,N,V,C,Hp,Wp)
             'img_metas': img_metas,
-            'geom': extra_geom              
+            'geom': extra_geom,
         }
-
    
 
 class GetDPTDepth(nn.Module):

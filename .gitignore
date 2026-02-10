@@ -213,7 +213,10 @@ inference_test_output
 *.pkl
 *.npy
 *.pth
+*.ckpt
+*.pt
 events.out.tfevents*
+lightning_logs/
 
 # vscode
 *.code-workspace
@@ -223,8 +226,10 @@ events.out.tfevents*
 .vim
 
 # data
-/data
-/pca_ckpts
+./data/
+./pca_ckpts/
 /train
 /outputs
+/results
+/vis
 README.md

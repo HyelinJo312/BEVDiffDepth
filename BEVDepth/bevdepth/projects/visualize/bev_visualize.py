@@ -18,6 +18,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import minmax_scale
+from scipy.ndimage import rotate
+from pyquaternion import Quaternion
 
 
 # -------------- utils --------------
@@ -130,7 +132,15 @@ def _draw_lidar_top_on_axes(nusc, sample_token, ax,
                             pts_stride=1,                  # take every Nth point
                             pts_alpha=0.9,                 # 0~1
                             box_lw=0.6,                    # GT box line width
-                            bev_extent=None):                   
+                            bev_extent=None,
+                            #=====NEW: GT boxes in EGO frame =====
+                            gt_boxes_ego=None,          # torch.Tensor (N,9) or np.ndarray
+                            gt_labels=None,             # optional (N,)
+                            class_names=None,           # optional list[str], index->name
+                            gt_box_lw=1.2,
+                            gt_box_alpha=0.95,
+                            gt_box_color="red",         # fallback color if class_names not provided
+                            draw_gt_heading=True,):                   
     sample_record = nusc.get('sample', sample_token)
     assert 'LIDAR_TOP' in sample_record['data'], "No LIDAR_TOP for this sample."
     lidar_token = sample_record['data']['LIDAR_TOP']
@@ -162,6 +172,67 @@ def _draw_lidar_top_on_axes(nusc, sample_token, ax,
         for box in boxes:
             c = _get_color(nusc, box.name)
             box.render(ax, view=view, colors=(c, c, c), linewidth=box_lw)
+            
+    if gt_boxes_ego is not None:
+        gt_np = _to_numpy(gt_boxes_ego)
+        if gt_np.ndim == 3:
+            gt_np = gt_np[0]  # (B,N,9) -> first
+        if gt_np.size != 0 and gt_np.shape[0] > 0:
+            # get ego<-lidar calibrated sensor transform, then invert (ego->lidar)
+            sd_rec = nusc.get('sample_data', lidar_token)
+            cs = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+            t_lidar2ego = np.array(cs['translation'], dtype=np.float32)      # lidar -> ego
+            q_lidar2ego = Quaternion(cs['rotation'])                         # lidar -> ego
+            q_ego2lidar = q_lidar2ego.inverse                                # ego -> lidar
+
+            # labels optional
+            labels_np = None
+            if gt_labels is not None:
+                labels_np = _to_numpy(gt_labels).astype(np.int64)
+
+            for i in range(gt_np.shape[0]):
+                x, y, z = gt_np[i, 0], gt_np[i, 1], gt_np[i, 2]
+                dx, dy, dz = gt_np[i, 3], gt_np[i, 4], gt_np[i, 5]
+                yaw = gt_np[i, 6]
+
+                # Box expects size in wlh = (width, length, height)
+                size_wlh = np.array([dy, dx, dz], dtype=np.float32)
+
+                # yaw in ego frame -> quaternion about z
+                q_box_ego = Quaternion(axis=[0, 0, 1], angle=float(yaw))
+
+                box_ego = Box(
+                    center=np.array([x, y, z], dtype=np.float32),
+                    size=size_wlh,
+                    orientation=q_box_ego,
+                )
+
+                # ego -> lidar: p_l = R^-1 (p_e - t)
+                box_ego.translate(-t_lidar2ego)
+                box_ego.rotate(q_ego2lidar)
+
+                # color: class-based if possible, else fixed
+                if (labels_np is not None) and (class_names is not None) and (0 <= labels_np[i] < len(class_names)):
+                    cname = class_names[int(labels_np[i])]
+                    c = _get_color(nusc, cname)
+                    c = tuple(c.tolist())
+                else:
+                    # fixed red
+                    c = (1.0, 0.0, 0.0)
+
+                box_ego.render(ax, view=view, colors=(c, c, c), linewidth=gt_box_lw)
+
+                if draw_gt_heading:
+                    # optional heading indicator: draw a short line from center to front
+                    # front direction in box frame is +x (length direction). We'll approximate using first two corners.
+                    try:
+                        corners = box_ego.corners()  # (3,8)
+                        cx, cy = box_ego.center[0], box_ego.center[1]
+                        fx, fy = float(corners[0, 0]),  float(corners[1, 0])  # one "front" corner
+                        ax.plot([cx, fx], [cy, fy], color=c, linewidth=gt_box_lw, alpha=gt_box_alpha)
+                    except Exception:
+                        pass
+
 
     # ★ apply bounds: prefer BEV extent if provided
     if bev_extent is not None:
@@ -174,6 +245,72 @@ def _draw_lidar_top_on_axes(nusc, sample_token, ax,
 
     ax.axis('off')
     ax.set_aspect('equal')
+
+
+def _boxes_to_corners_xy_ego9d(gt_boxes_ego):
+    """
+    gt_boxes_ego: (N,9) = [x,y,z, dx,dy,dz, yaw, vx,vy] in EGO frame
+    return: corners (N,4,2) in ego/world xy
+    """
+    boxes = np.asarray(gt_boxes_ego, dtype=np.float32)
+    if boxes.ndim != 2 or boxes.shape[1] < 7:
+        return np.zeros((0, 4, 2), dtype=np.float32)
+
+    x = boxes[:, 0]
+    y = boxes[:, 1]
+    dx = boxes[:, 3]
+    dy = boxes[:, 4]
+    yaw = boxes[:, 6]  # rad
+
+    hx = 0.5 * dx
+    hy = 0.5 * dy
+
+    # local corners in the box frame (front-right, front-left, back-left, back-right)
+    local = np.stack([
+        np.stack([ hx,  hy], axis=-1),
+        np.stack([ hx, -hy], axis=-1),
+        np.stack([-hx, -hy], axis=-1),
+        np.stack([-hx,  hy], axis=-1),
+    ], axis=1)  # (N,4,2)
+
+    c = np.cos(yaw)[:, None, None]
+    s = np.sin(yaw)[:, None, None]
+    R = np.concatenate([
+        np.concatenate([c, -s], axis=-1),
+        np.concatenate([s,  c], axis=-1),
+    ], axis=-2)  # (N,2,2)
+
+    corners = local @ R.transpose(0, 2, 1)  # (N,4,2)
+    corners[..., 0] += x[:, None]
+    corners[..., 1] += y[:, None]
+    return corners.astype(np.float32)
+
+def _draw_gt_boxes_ego_on_axes(ax, gt_boxes, color="r", lw=1.2, alpha=0.9, draw_heading=True):
+    """
+    Draw GT boxes directly in EGO metric coordinates (NO extra rotation compensation).
+    Works with your gt_boxes format from get_gt().
+    """
+    if gt_boxes is None:
+        return
+    boxes_np = _to_numpy(gt_boxes)
+
+    # handle (B,N,9) or list-of-tensors outside
+    if boxes_np.ndim == 3:
+        boxes_np = boxes_np[0]
+    if boxes_np.size == 0:
+        return
+
+    corners = _boxes_to_corners_xy_ego9d(boxes_np)  # (N,4,2)
+    for i in range(corners.shape[0]):
+        pts = corners[i]  # (4,2)
+        xx = np.concatenate([pts[:, 0], pts[:1, 0]])
+        yy = np.concatenate([pts[:, 1], pts[:1, 1]])
+        ax.plot(xx, yy, color=color, linewidth=lw, alpha=alpha)
+
+        if draw_heading:
+            cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+            fx, fy = 0.5 * (pts[0, 0] + pts[1, 0]), 0.5 * (pts[0, 1] + pts[1, 1])
+            ax.plot([cx, fx], [cy, fy], color=color, linewidth=lw, alpha=alpha)
 
 
 # -------------- main: triplet renderer (Activation Map)--------------
@@ -196,8 +333,16 @@ def render_bev_triplet(
     # fig
     figsize=(15, 5), dpi=240, show=False,
     signed=False,               
-    signed_clip_pct=98.0          
-):
+    signed_clip_pct=98.0,
+    gt_boxes=None,
+    gt_labels=None,
+    class_names=None,
+    draw_gt_on_bev=True,
+    gt_color="r",
+    gt_lw=1.2,
+    gt_alpha=0.9,
+    gt_draw_heading=True,          
+    ):
     A = _to_numpy(bev_pre_bchw)
     B = _to_numpy(bev_post_bchw)
     if A.ndim != 4 or B.ndim != 4:
@@ -215,6 +360,13 @@ def render_bev_triplet(
     feat_b = B[b].reshape(Cb, H*W).T
     ea = _aggregate_energy(feat_a, agg=agg, whiten=whiten).reshape(H, W)
     eb = _aggregate_energy(feat_b, agg=agg, whiten=whiten).reshape(H, W)
+    
+    # ea = ea.T
+    # eb = eb.T
+    # ea = np.rot90(ea, -1)   # ← 이게 네 기준에서 "오른쪽으로 90도"
+    # eb = np.rot90(eb, -1)
+    # ea = rotate(ea, angle=45, reshape=False, order=1, mode='nearest')
+    # eb = rotate(eb, angle=45, reshape=False, order=1, mode='nearest')
 
     ea = _gaussian_blur_np(ea, sigma=smooth_sigma)
     eb = _gaussian_blur_np(eb, sigma=smooth_sigma)
@@ -248,6 +400,12 @@ def render_bev_triplet(
     if bev_extent is not None:
         axes[0].set_xlim(bev_extent[0], bev_extent[1])
         axes[0].set_ylim(bev_extent[2], bev_extent[3])
+    if draw_gt_on_bev and (gt_boxes is not None):
+        gb = gt_boxes[b] if (isinstance(gt_boxes, (list, tuple)) and len(gt_boxes) > b) else gt_boxes
+        _draw_gt_boxes_ego_on_axes(
+            axes[0], gb,
+            color=gt_color, lw=gt_lw, alpha=gt_alpha,
+            draw_heading=gt_draw_heading)
     axes[0].set_title(labels[0]); axes[0].axis('off')
 
     # axes[1].imshow(
@@ -258,6 +416,12 @@ def render_bev_triplet(
     if bev_extent is not None:
         axes[1].set_xlim(bev_extent[0], bev_extent[1])
         axes[1].set_ylim(bev_extent[2], bev_extent[3])
+    if draw_gt_on_bev and (gt_boxes is not None):
+        gb = gt_boxes[b] if (isinstance(gt_boxes, (list, tuple)) and len(gt_boxes) > b) else gt_boxes
+        _draw_gt_boxes_ego_on_axes(
+            axes[1], gb,
+            color=gt_color, lw=gt_lw, alpha=gt_alpha,
+            draw_heading=gt_draw_heading)
     axes[1].set_title(labels[1]); axes[1].axis('off')
 
     if (nusc is not None) and (sample_token is not None):
@@ -273,8 +437,13 @@ def render_bev_triplet(
                                 pts_stride=1,        # ↓ 다운샘플
                                 pts_alpha=0.9,
                                 box_lw=0.6,
-                                bev_extent=bev_extent
-                            )
+                                bev_extent=bev_extent,
+                                # gt_boxes_ego=(gt_boxes[b] if (isinstance(gt_boxes, (list, tuple)) and len(gt_boxes) > b) else gt_boxes),
+                                gt_boxes_ego=None,
+                                gt_labels=(gt_labels[b] if (isinstance(gt_labels, (list, tuple)) and len(gt_labels) > b) else gt_labels),
+                                class_names=class_names,           
+                                gt_box_lw=1.4,
+                                gt_box_alpha=0.95)
     else:
         axes[2].text(0.5, 0.5, "LiDAR_TOP unavailable", ha="center", va="center", fontsize=10)
         axes[2].axis('off'); axes[2].set_aspect('equal')

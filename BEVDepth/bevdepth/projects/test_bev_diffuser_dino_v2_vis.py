@@ -30,7 +30,7 @@ from accelerate.utils import set_seed
 from packaging import version
 from transformers import CLIPTextModel, CLIPTokenizer
 # from diffusers import DDPMScheduler, DDIMScheduler, UNet2DConditionModel
-
+from functools import partial
 import mmcv
 from mmcv import Config
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -38,16 +38,21 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint, wrap_fp16_mo
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))+"/..")
-from projects.mmdet3d_plugin.datasets.builder import build_dataloader
-from projects.mmdet3d_plugin.bevformer.apis.test import custom_encode_mask_results, collect_results_cpu
+# from bevdepth.datasets.nusc_det_dataset_v2 import NuscDetDataset, collate_fn
+from bevdepth.projects.data_utils import CustomNuScenesDiffusionDataset, collate_fn, DistributedGroupSampler
+# from bevdepth.projects.mmdet3d_plugin.datasets.builder import build_dataloader
+# from bevdepth.projects.mmdet3d_plugin.bevformer.apis.test import custom_encode_mask_results, collect_results_cpu
 from mmdet.apis import set_random_seed
 
-from scheduler_utils import DDIMGuidedScheduler
-from model_utils import get_bev_model, build_unet, instantiate_from_config
-from layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
-from projects.bevdiffuser.fm_feature import GetDINOv2Cond 
-from projects.bevdiffuser.visualize.bev_visualize import *
-from projects.bevdiffuser.visualize.bev_visualize_multi_scale import *
+from bevdepth.projects.scheduler_utils import DDIMGuidedScheduler
+from bevdepth.projects.model_utils import get_bev_model, build_unet, instantiate_from_config, get_bevdepth_model
+from bevdepth.projects.layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
+from bevdepth.projects.fm_feature import GetDINOV2Feat
+from bevdepth.utils.torch_dist import all_gather_object, get_rank, synchronize
+from bevdepth.evaluators.det_evaluators import DetNuscEvaluator
+from torch.utils.data.distributed import DistributedSampler
+from bevdepth.projects.visualize.bev_visualize import render_bev_triplet, bev_extent_from_cfg
+# from bevdepth.projects.visualize.bev_visualize_v2 import render_bev_triplet_activation, bev_extent_from_point_cloud_range
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -140,11 +145,17 @@ def parse_args():
         help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
         ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
 
+    parser.add_argument(
+        "--depth_dir",
+        type=str,
+        default=None
+    )
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
     return args
+
 
 
 def test():
@@ -159,6 +170,10 @@ def test():
     if args.launcher != 'none':
         init_dist(args.launcher, **bev_cfg.dist_params)
         
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMGuidedScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -166,40 +181,43 @@ def test():
     if args.prediction_type is not None:
         noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     
-    bev_model = get_bev_model(args)
-    if not args.use_classifier_guidence:
-        bev_model.requires_grad_(False)
+    bev_model = get_bevdepth_model(bev_cfg, args).to(device)
+    bev_model.requires_grad_(False)
     bev_model.eval()
+
+    # unet = instantiate_from_config(bev_cfg.unet)
+    # # unet = build_unet(bev_cfg.unet)
+    # unet.from_pretrained(args.checkpoint_dir, subfolder="unet")
+    # unet.to(device, dtype=torch.float32)
+    # unet.requires_grad_(False) 
+    # unet.eval()
+    unet = None
     
-    unet = instantiate_from_config(bev_cfg.unet)
-    unet.from_pretrained(args.checkpoint_dir, subfolder="unet")
-    unet.to(bev_model.device, dtype=torch.float32)
-    unet.requires_grad_(False) 
-    unet.eval()
+    get_dino = GetDINOV2Feat()
     
-    get_dino = GetDINOv2Cond()
+    # dataset = NuscDetDataset(bev_cfg.data.val)
+    dataset = CustomNuScenesDiffusionDataset(bev_cfg.data.val)
+
+    rank, world_size = get_dist_info()
     
-    bev_cfg.data.test.test_mode = True
-    bev_cfg.data.test.load_annos = True
-    dataset = build_dataset(bev_cfg.data.test,
-                            default_args={
-                                        'pc_range': bev_cfg.point_cloud_range,
-                                        'use_3d_bbox': bev_cfg.use_3d_bbox,
-                                        'num_classes': bev_cfg.num_classes,
-                                        'num_bboxes': bev_cfg.num_bboxes,
-                                    })
-    dataloader = build_dataloader(
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    
+    dataloader = torch.utils.data.DataLoader(
         dataset,
-        samples_per_gpu=bev_cfg.data.samples_per_gpu,
-        workers_per_gpu=bev_cfg.data.workers_per_gpu,
-        dist=(args.launcher != 'none'),
+        batch_size=1,
+        num_workers=4,
         shuffle=False,
-        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
+        persistent_workers=True,
+        collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, 
+                           has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+        # collate_fn=partial(collate_fn, is_return_depth=bev_cfg.use_fusion, has_depth_any=True),
+        sampler=sampler,
     )
-  
-    # save_path = os.path.join('../../test', args.bev_config.split('/')[-1].split('.')[-2], args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
-    save_path = os.path.join('../../../results/pretrain_stage1', args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
-        
+    
+    save_path = "/home/user/data/processed_dataset/hyelin/bevdiffdepth_vis"
+    # save_path = os.path.join('../../../results', args.bev_config.split('/')[-1].split('.')[-2], args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
+    # save_path = os.path.join('../../../results/stage1', args.checkpoint_dir.split('/')[-2], args.checkpoint_dir.split('/')[-1])
+
     evaluate(unet=unet,
              bev_model=bev_model,
              get_dino=get_dino,
@@ -207,6 +225,7 @@ def test():
              dataset=dataset,
              dataloader=dataloader,
              bev_cfg=bev_cfg,
+             device=device,
              eval=args.eval,
              save_path=save_path,
              noise_timesteps=args.noise_timesteps,
@@ -222,12 +241,23 @@ def evaluate(unet,
              dataset,
              dataloader,
              bev_cfg,
+             device,
              eval='bbox',
              save_path='',
              noise_timesteps=0,
              denoise_timesteps=0,
              num_inference_steps=0,
              use_classifier_guidence=False):
+             
+    def get_classifier_gradient(x, **kwargs):
+        x_ = x.detach().requires_grad_(True)
+        x_ = x_.permute(0, 2, 3, 1)
+        x_ = x_.reshape(-1, bev_cfg.bev_h_*bev_cfg.bev_w_, bev_cfg._dim_)
+        loss = bev_model(return_loss=False, only_bev=False, given_bev=x_, return_eval_loss=True, **kwargs)
+        gradient = torch.autograd.grad(loss, x_)[0]
+        gradient = gradient.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
+        gradient = gradient.permute(0, 3, 1, 2)
+        return gradient    
     
     ds = getattr(dataloader, "dataset", dataset)
     nusc = getattr(ds, "nusc", None)
@@ -239,53 +269,27 @@ def evaluate(unet,
             verbose=False
         )
     
-    
-    def rearrange_cam_paths(paths):
-        import os
-        order = [
-            "CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT",
-            "CAM_BACK_LEFT",  "CAM_BACK",  "CAM_BACK_RIGHT"
-        ]
-        def cam_key(p):
-            parts = os.path.normpath(p).split(os.sep)
-            cam = None
-            try:
-                i = parts.index('samples')
-                cam = parts[i+1]
-            except Exception:
-                pass
-            return order.index(cam) if cam in order else len(order)
-        paths = list(paths)[:6]
-        return sorted(paths, key=cam_key)
-    
-    det_res_path = f"{noise_timesteps}_{denoise_timesteps}_{num_inference_steps}"
-    bbox_results = []
-    mask_results = []
-    have_mask = False
-    
     rank, world_size = get_dist_info()
+
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
-
-    extent = bev_extent_from_cfg(bev_cfg) 
-
+    
     for step, batch in enumerate(dataloader):
+        # (imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_anything) = batch
+        (imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_maps, segmaps) = batch
         
-        latents = bev_model(return_loss=False, only_bev=True, **batch).detach()
+        sample_token = img_metas[0]['token']
         
-        latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
-        
-        latents = latents.permute(0, 3, 1, 2)
-        
-        original_bev = latents.detach().clone()  # (B,C,H,W)
-
-        img = batch['img'][0].data[0]
-        img_metas = batch['img_metas'][0].data[0]
-        sample_token = img_metas[0]['sample_idx']
-        img_filenames = img_metas[0]['filename']
-        cam_paths = rearrange_cam_paths(img_filenames)
-        
+        # depth = depth_anything.to(device=device)
+        depth = depth_maps.to(device)
+        if torch.cuda.is_available():
+            for key, value in mats.items():
+                mats[key] = value.to(device)
+            imgs = imgs.to(device); key_img = imgs[:, 0, ...]
+            gt_boxes = [gt_box.to(device) for gt_box in gt_boxes]
+            gt_labels = [gt_label.to(device) for gt_label in gt_labels]
+    
         def get_dino_uncond(cond):
             uncond = {k: v.clone() if isinstance(v, torch.Tensor) else v
                      for k, v in cond.items()}
@@ -295,42 +299,37 @@ def evaluate(unet,
             uncond['last_tokens'] = last_tokens_u
             return uncond
         
+        dino_cond = get_dino(imgs, img_metas)
+        dino_uncond = get_dino_uncond(dino_cond) 
+        latents = bev_model(imgs, depth, mats, img_metas, only_bev=True, dino_out=dino_cond).detach()
+        original_bev = latents.clone().cpu()
+        transform_bev = original_bev.transpose(-1, -2).flip(-1)
+        # if noise_timesteps > 0:
+        #     if noise_timesteps > 1000:
+        #         latents = torch.randn_like(latents)
+        #         latents = latents * noise_scheduler.init_noise_sigma
+        #     else:   
+        #         noise = torch.randn_like(latents)
+        #         noise_timesteps = torch.as_tensor(noise_timesteps).long()   
+        #         latents = noise_scheduler.add_noise(latents, noise, noise_timesteps)
         
-        if noise_timesteps > 0:
-            if noise_timesteps > 1000:
-                latents = torch.randn_like(latents)
-                latents = latents * noise_scheduler.init_noise_sigma
-            else:   
-                noise = torch.randn_like(latents)
-                noise_timesteps = torch.as_tensor(noise_timesteps).long()   
-                latents = noise_scheduler.add_noise(latents, noise, noise_timesteps)
-        
-        if denoise_timesteps > 0:    
-            cond = get_dino(img, img_metas)    
-            uncond = get_dino_uncond(cond)
+        # if denoise_timesteps > 0:    
+        #     # # DDIM
+        #     # layout_cond, layout_uncond = get_condition(gt_layout, use_cond=True), get_condition(gt_layout, use_cond=False)
+        #     noise_scheduler.config.num_train_timesteps=denoise_timesteps
+        #     noise_scheduler.set_timesteps(num_inference_steps=num_inference_steps)
             
-            # # DDIM
-            noise_scheduler.config.num_train_timesteps=denoise_timesteps
-            noise_scheduler.set_timesteps(num_inference_steps=num_inference_steps)
-            
-            for _, t in enumerate(noise_scheduler.timesteps): # always use multi-scale features
-                t_batch = torch.tensor([t] * latents.shape[0], device=latents.device)
-                if t != noise_scheduler.timesteps[-1]:
-                    noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, **uncond)[0], unet(latents, t_batch, **cond)[0]
-                    noise_pred = noise_pred_uncond + 2 * (noise_pred_cond - noise_pred_uncond)
-                    latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False, classifier_gradient=None)[0]
-                else:
-                    _, multi_feat, out_list = unet(latents, t_batch, **cond)
-   
-        # denoised_bev = latents.detach().clone()
+        #     for _, t in enumerate(noise_scheduler.timesteps): 
+        #         t_batch = torch.tensor([t] * latents.shape[0], device=latents.device)
+        #         noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, mats, dino_uncond)[0], unet(latents, t_batch, mats, dino_cond)[0]
+        #         # noise_pred_uncond, noise_pred_cond = unet(latents, t_batch, mats, dino_uncond, **layout_uncond)[0], unet(latents, t_batch, mats, dino_cond, **layout_cond)[0]
+        #         noise_pred = noise_pred_uncond + 3 * (noise_pred_cond - noise_pred_uncond)
+        #         classifier_gradient = get_classifier_gradient(latents, **batch) if use_classifier_guidence else None
+        #         latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False, classifier_gradient=classifier_gradient)[0]
         
-        # extract multi-scale features
-        cond = get_dino(img, img_metas)    
-        t_test = torch.tensor([10] * latents.shape[0], device=latents.device)  
-        # output, multi_feat, out_list = unet(latents, t_test, **cond) 
-        output, out_list = unet(latents, t_test, **cond) 
+        # denoised_bev = latents.detach().clone().cpu().transpose(-1, -2).flip(-1)
 
-        ## -------------------------------- PCA -------------------------------- ##
+        # -------------------------------- PCA -------------------------------- ##
         
         #--------- version 1 : gaussian blur ---------
         # pre_rgb, post_rgb, pca = visualize_bev_rgb_pca_triplet(
@@ -341,7 +340,7 @@ def evaluate(unet,
         #     blur_sigma=0.8, edge_preserve="bilateral",
         #     interp="bicubic",
         #     out_dir=f"{save_path}/visualize/rgb_pca_triplet_bicubic_multi_scale",
-        #     title=f"step {step} | BEV feature (RGB-PCA smooth)",
+            #     title=f"step {step} | BEV feature (RGB-PCA smooth)",
         #     dpi=300,
         #     nusc=nusc, sample_token=sample_token,
         #     show=False
@@ -405,103 +404,54 @@ def evaluate(unet,
         #     pca_gamma=1.2
         #     )
         
-        
-     
+        # xmin, xmax, dx = bev_cfg.backbone_conf['x_bound']
+        # ymin, ymax, dy = bev_cfg.backbone_conf['y_bound']
+        # H, W = original_bev.shape[-2:]
+        # extent = (xmin, xmin + W*dx, ymin, ymin + H*dy)   
+        # extent = (xmin, xmin, ymin, ymax)  
+         
+        xmin, xmax, dx = bev_cfg.backbone_conf['x_bound']
+        ymin, ymax, dy = bev_cfg.backbone_conf['y_bound']
+        extent = (xmin, xmax, ymin, ymax)
+                
         ## ----------------------------- Activation Map ----------------------------- ##
-        
-        # render_bev_triplet(
-        #     original_bev, denoised_bev, b=0,
-        #     nusc=nusc, sample_token=sample_token,
-        #     out_dir=f"{save_path}/visualize/pca_bev_signed",
-        #     title=f"step {step} | BEV feature",
-        #     labels=("original", "denoised", "LiDAR Top View"),
-        #     agg="l1", whiten=True, smooth_sigma=0.8,
-        #     joint_clip=None, gamma=1.0,   # joint_clip=(1,99)
-        #     bev_cmap="bwr", bev_interp="bilinear",
-        #     bev_extent=extent,           
-        #     bev_origin="lower",          
-        #     lidar_axes_limit=50.0,
-        #     figsize=(15,5), dpi=300, show=False,
-        #     signed=True, signed_clip_pct=98.0
-        # )
-        
-        #------- only four multi-scale features --------
-        # f1, f2, f3, f4 = output_feats1[2], output_feats2[2], output_feats3[2], output_feats4[2] 
-        # render_unet_intermediates(
-        #     f1, f2, f3, f4, b=0,
-        #     nusc=nusc, sample_token=sample_token,
-        #     out_dir=f"{save_path}/visualize/unet_feats_inter4_timestep0-999",
-        #     title=f"step {step} | UNet features",
-        #     # labels=("mid 12×12", "out 12×12", "out 25×25", "out 50×50", "LiDAR Top"),
-        #     labels=("T=0", "T=10", " T=100", "T=999", "LiDAR_TOP"),
-        #     # --- choose one ---
-        #     mode="energy",          # 채널-집계 에너지 (권장: 비교용)
-        #     agg="l1", whiten=True, smooth_sigma=0.8,
-        #     joint_clip=(2.0, 98.0), gamma=1.0,
-        #     bev_cmap="viridis", bev_interp="bilinear",
-        #     bev_extent=extent, bev_origin="lower",
-        #     lidar_axes_limit=50.0, lidar_view=np.eye(4), lidar_show_boxes=True,
-        #     figsize=(22,4.5), dpi=300, show=False,
-        # )
-        
-        #------- original feature & multi-scale features & concat feature -------
-        f1, f2, f3, f4 = out_list
-        render_unet_intermediates_four(
-            pre_bchw=original_bev,          # ← pre-UNet
-            f1_bchw=f1, f2_bchw=f2, f3_bchw=f3, f4_bchw=f4,  # 중간/출력들
-            concat_bchw=output,       # ← multi-scale concat
-            b=0,
+        render_bev_triplet(
+            original_bev, transform_bev, b=0,
             nusc=nusc, sample_token=sample_token,
-            out_dir=f"{save_path}/visualize/unet_intermediates",
-            title=f"step {step} | UNet features",
-            mode="energy", agg="l1", whiten=True,
-            smooth_sigma=0.8,
-            joint_clip=(2,98), gamma=1.0,
+            out_dir=f"{save_path}/visualize/activation_map_lidar_gt_box",
+            title=f"step {step} | BEV feature",
+            labels=("original", "transformed", "LiDAR Top View"),
+            agg="l1", whiten=True, smooth_sigma=0.8,
+            joint_clip=(2.0, 98.0), gamma=1.0,   # joint_clip=(1,99)
             bev_cmap="viridis", bev_interp="bilinear",
-            bev_extent=extent, bev_origin="lower",
+            bev_extent=extent,           
+            bev_origin="lower",          
             lidar_axes_limit=50.0,
-            figsize=(30, 5), dpi=300, show=False
+                figsize=(15,5), dpi=300, show=False,
+            signed=False, signed_clip_pct=98.0,
+            gt_boxes=gt_boxes,
+            gt_labels=gt_labels,
+            class_names=bev_cfg.CLASSES,
+            draw_gt_on_bev=True,
+            gt_color="r",
         )
         
-        render_sixcams_lidar_bev(
-            pre_bchw=original_bev,          # ← pre-UNet
-            f1_bchw=f1, f2_bchw=f2, f3_bchw=f3, f4_bchw=f4,  # 중간/출력들
-            concat_bchw=multi_feat,       # ← multi-scale concat
-            b=0,
-            nusc=nusc, sample_token=sample_token,
-            out_dir=f"{save_path}/visualize/unet_intermediates_img_v2",
-            title=f"step {step} | UNet features",
-            mode="energy", agg="l1", whiten=True,
-            smooth_sigma=0.8,
-            joint_clip=(2,98), gamma=1.0,
-            bev_cmap="viridis", bev_interp="bilinear",
-            bev_extent=extent, bev_origin="lower",
-            lidar_axes_limit=50.0,
-            cam_image_paths=cam_paths,
-            figsize=(26, 10), dpi=300, show=False
-        )
+        if rank == 0:
+            prog_bar.update()
         
-        #------- original feature & all inter features & concat feature -------
-        # inter_list = output_feats
-        # inter_list.append(output)
-        # res = render_unet_intermediates_all(
-        #         inter_list=inter_list,    # 작은 해상도 -> 큰 해상도
-        #         pre_bchw=original_bev,
-        #         concat_bchw=multi_feat,
-        #         b=0,
-        #         nusc=nusc, sample_token=sample_token,
-        #         out_dir=f"{save_path}/visualize/unet_intermediates_all_t10",
-        #         title=f"step {step} | UNet Intermediates (Energy)",
-        #         mode="energy", agg="l1", whiten=True,
-        #         smooth_sigma=0.8,
-        #         joint_clip=(2,98), gamma=1.0,
-        #         bev_cmap="viridis", bev_interp="bilinear",
-        #         bev_extent=extent, bev_origin="lower",
-        #         lidar_axes_limit=50.0,
-        #         figsize=(22, 8), dpi=300, show=False,
+        # debug_bev_orientation_side_by_side(
+        #         ea, nusc, sample_token,
+        #         bev_extent=extent,
+        #         out_file=f"{save_path}/dbg_orient/orient_grid_step{step}.png",
+        #         lidar_pts_size=3.0,     # 더 두껍게
+        #         lidar_pts_stride=1,
+        #         lidar_pts_alpha=1.0,
+        #         show_boxes=True,
         #     )
-
         
+
+   
+
 
   
 

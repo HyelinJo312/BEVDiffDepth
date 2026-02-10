@@ -21,8 +21,6 @@ from bevdepth.utils.torch_dist import all_gather_object, get_rank, synchronize
 
 H = 900
 W = 1600
-# final_dim = (480, 900)
-# final_dim = (490, 812)
 final_dim = (448, 798)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
@@ -32,10 +30,10 @@ backbone_conf = {
     'x_bound': [-51.2, 51.2, 0.8],
     'y_bound': [-51.2, 51.2, 0.8],
     'z_bound': [-5, 3, 8],
-    'd_bound': [2.0, 58.0, 0.5],
+    'd_bound': [2.0, 58.0, 0.25],
     'final_dim': final_dim,
-    'output_channels': 80,
-    'downsample_factor': 14,  # 16   # TODO: DINOv2 patch size=14 고려해서 14의 배수로 해봐도 괜찮을듯,
+    'output_channels': 256,
+    'downsample_factor': 14,  # 16   
     'use_soft_depth': True,
     # 'img_backbone_conf':
     # dict(
@@ -56,8 +54,10 @@ backbone_conf = {
     # 'depth_net_conf':
     # dict(in_channels=512, mid_channels=512)
 }
+
 ida_aug_conf = {
-    'resize_lim': (0.386, 0.55),
+    # 'resize_lim': (0.386, 0.55),
+    'resize_lim': (0.55, 0.70),
     'final_dim': final_dim,
     'rot_lim': (-5.4, 5.4),
     'H': H,

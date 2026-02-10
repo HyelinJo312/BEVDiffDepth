@@ -26,40 +26,47 @@ import numpy as np
 import torch
 torch.backends.cudnn.enabled = False
 import torch.nn.functional as F
+import torch.utils.data
 import torch.utils.checkpoint
 import transformers
 import diffusers
 import importlib
-
+from functools import partial
+from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel
 from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+import logging
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from packaging import version
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
-# from diffusers.training_utils import EMAModel
 
 from mmcv import Config, DictAction
+from torch.utils.data.distributed import DistributedSampler
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,save_checkpoint, wrap_fp16_model)
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))+"/..")
-from projects.mmdet3d_plugin.datasets.builder import build_dataloader
+# from bevdepth.datasets.nusc_det_dataset_v2 import NuscDetDataset, collate_fn
+from bevdepth.projects.utils.data_utils import CustomNuScenesDiffusionDataset, collate_fn, DistributedGroupSampler
 from mmdet.apis import set_random_seed
 
-from layout_diffusion.layout_dino_diffusion_unet_v2 import LayoutDiffusionUNetModel
-from scheduler_utils import DDIMGuidedScheduler
-from model_utils import get_bev_model, build_unet, instantiate_from_config
-from test_bev_diffuser_dino import evaluate
+from bevdepth.projects.layout_diffusion.layout_diffusion_unet import LayoutDiffusionUNetModel
+from bevdepth.projects.ldm.modules.diffusionmodules.openaimodel import UNetModel
+from bevdepth.projects.utils.scheduler_utils import DDIMGuidedScheduler
+from bevdepth.projects.utils.model_utils import get_bev_model, build_unet, instantiate_from_config, get_bevdepth_model
+from bevdepth.projects.test_bev_diffuser_dino_v2_seg import evaluate
 from torch.utils.tensorboard import SummaryWriter
-from bevdepth.projects.fm_feature import GetDINOv2Cond
+from bevdepth.projects.fm_feature import GetDINOV2Feat
+from bevdepth.projects.layout_diffusion.diffusion_unet_v2_seg import SPADEResBlock, ResBlock, Downsample, Upsample
+from bevdepth.projects.ldm.modules.attention import SpatialTransformer
+from bevdepth.projects.utils.optimizer_utils import build_scheduler, get_scheduler_info
 
-logger = get_logger(__name__, log_level="INFO")
+# logger = get_logger(__name__, log_level="INFO")
 
 def train():
     args = parse_args()
@@ -84,7 +91,9 @@ def train():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
+        force=True,
     )
+    logger = get_logger(__name__, log_level="INFO")
     logger.info(accelerator.state, main_process_only=False)
 
     # change output dir first
@@ -107,6 +116,7 @@ def train():
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
         
+        
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -125,33 +135,48 @@ def train():
         noise_scheduler.register_to_config(prediction_type=args.prediction_type)
         DDIM_scheduler.register_to_config(prediction_type=args.prediction_type)
         
-    bev_model = get_bev_model(args)
-
-    # Freeze vae and text_encoder
+    # bev_model = get_bev_model(args)
+    bev_model = get_bevdepth_model(bev_cfg, args)
     bev_model.requires_grad_(False)
-    if args.task_loss_scale != 0:
-        bev_model.module.pts_bbox_head.transformer.decoder.requires_grad_(True)
-        bev_model.module.pts_bbox_head.transformer.reference_points.requires_grad_(True)
-        bev_model.module.pts_bbox_head.cls_branches.requires_grad_(True)
-        bev_model.module.pts_bbox_head.reg_branches.requires_grad_(True)
+    bev_model.head.requires_grad_(True)
     
-    def get_task_loss(x, **kwargs):
-        x = x.permute(0, 2, 3, 1).contiguous()
-        x = x.reshape(-1, bev_cfg.bev_h_*bev_cfg.bev_w_, bev_cfg._dim_)
-        losses = bev_model(return_loss=True, given_bev=x, **kwargs)
-        loss, _ = bev_model.module._parse_losses(losses)
-        return loss
-    
-    unet = build_unet(bev_cfg.unet)
+    def get_task_loss(x, sweep_imgs, sweep_depth, mats, img_metas, gt_boxes, gt_labels):
+        preds = bev_model(sweep_imgs, sweep_depth, mats, img_metas, given_bev=x)
+        if isinstance(bev_model, torch.nn.parallel.DistributedDataParallel):
+            targets = bev_model.module.get_targets(gt_boxes, gt_labels)
+            detection_loss = bev_model.module.loss(targets, preds)
+        else:
+            targets = bev_model.get_targets(gt_boxes, gt_labels)
+            detection_loss = bev_model.loss(targets, preds)
+        return detection_loss
+
+    unet = instantiate_from_config(bev_cfg.unet)
+    # unet = build_unet(bev_cfg.unet)
     if args.pretrained_unet_checkpoint is not None and (os.path.isfile(args.pretrained_unet_checkpoint) or os.path.isdir(args.pretrained_unet_checkpoint)):
         unet.from_pretrained(args.pretrained_unet_checkpoint, subfolder="unet")
-        # train only the downsample and upsample layers
-        unet.requires_grad_(False)
-        unet.downsample_blocks.requires_grad_(True)
-        unet.upsample_blocks.requires_grad_(True)
+        print(f"Successfully loaded pretrained unet from {args.pretrained_unet_checkpoint}")
 
-    # Get DINOv2 feature extractor
-    get_dino = GetDINOv2Cond()
+        unet.requires_grad_(True)
+        # Freeze specific backbone components
+        unet.time_embed.requires_grad_(False)
+        unet.input_blocks[0].requires_grad_(False)  # Freeze First Input Convolution
+        unet.downsample_blocks.requires_grad_(False)
+        unet.upsample_blocks.requires_grad_(False)   
+        
+        frozen_count = 0
+        for name, module in unet.named_modules():
+            # output_blocks는 전체 unfreeze (SPADEResBlock + ResBlock 모두)
+            if 'output_blocks' in name:
+                continue  # output_blocks는 trainable 유지
+            if isinstance(module, ResBlock):
+                if not isinstance(module, SPADEResBlock):
+                    module.requires_grad_(False)
+                    frozen_count += 1
+        # Print trainable status
+        trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in unet.parameters())
+        print(f"Frozen {frozen_count} backbone blocks (ResBlock in input_blocks/middle_block).")
+        print(f"Trainable parameters: {trainable_params} / {all_params} ({trainable_params/all_params:.2%})")
 
     assert version.parse(accelerate.__version__) >= version.parse("0.16.0"), "accelerate 0.16.0 or above is required"
 
@@ -175,101 +200,102 @@ def train():
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
-    optimizer_cls = torch.optim.AdamW
-
-    trained_params = list(unet.parameters())
-    if args.task_loss_scale != 0:
-        trained_params += list(bev_model.parameters())
+    # learning_rate = args.learning_rate
+    basic_lr_per_img = 2e-4 / 8
+    learning_rate = basic_lr_per_img * args.train_batch_size * accelerator.num_processes
     
-    learning_rate = args.learning_rate
+    # unet (pretrained): 0.1x base_lr, bev_model.head (new): 1x base_lr
+    param_groups = [
+        {'params': [p for p in unet.parameters() if p.requires_grad], 'lr': learning_rate * 0.1, 'name': 'unet'},
+        {'params': [p for p in bev_model.head.parameters() if p.requires_grad], 'lr': learning_rate, 'name': 'bev_head'}
+    ]
 
-    optimizer = optimizer_cls(
-        trained_params,
-        lr=learning_rate,
+    optimizer = torch.optim.AdamW(
+        param_groups,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
-    )
-    
-    with accelerator.main_process_first():
-        train_dataset = build_dataset(bev_cfg.data.train, 
-                                      default_args={
-                                          'pc_range': bev_cfg.point_cloud_range,
-                                          'use_3d_bbox': bev_cfg.use_3d_bbox,
-                                          'num_classes': bev_cfg.num_classes,
-                                          'num_bboxes': bev_cfg.num_bboxes,
-                                      })
-        
-        bev_cfg.data.test.load_annos = True
-        val_dataset = build_dataset(bev_cfg.data.test,
-                                    default_args={
-                                        'pc_range': bev_cfg.point_cloud_range,
-                                        'use_3d_bbox': bev_cfg.use_3d_bbox,
-                                        'num_classes': bev_cfg.num_classes,
-                                        'num_bboxes': bev_cfg.num_bboxes,
-                                    })
-        
-      
-    # DataLoaders creation:
-    train_dataloader = build_dataloader(
-        train_dataset,
-        samples_per_gpu=args.train_batch_size, 
-        workers_per_gpu=args.dataloader_num_workers,
-        num_gpus=get_dist_info()[1],
-        dist=(args.launcher != 'none'),
-        seed=args.seed,
-        shuffler_sampler=bev_cfg.data.shuffler_sampler,
-        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
-    )
-    
-    val_dataloader = build_dataloader(
-        val_dataset,
-        samples_per_gpu=bev_cfg.data.samples_per_gpu,
-        workers_per_gpu=bev_cfg.data.workers_per_gpu,
-        dist=(args.launcher != 'none'),
-        shuffle=False,
-        nonshuffler_sampler=bev_cfg.data.nonshuffler_sampler,
-    )
-    
-    def get_condition(batch):
-        cond = {}
-        
-        if 'layout_obj_classes' in batch:
-            cond['obj_class'] = torch.stack(batch['layout_obj_classes'].data[0])
-        if 'layout_obj_bboxes' in batch:
-            cond['obj_bbox'] = torch.stack(batch['layout_obj_bboxes'].data[0])
-        if 'layout_obj_is_valid' in batch:
-            cond['is_valid_obj'] = torch.stack(batch['layout_obj_is_valid'].data[0]) 
-        if 'layout_obj_names' in batch:
-            cond['obj_name'] = torch.stack(batch['layout_obj_names'].data[0])
-        
-        if np.random.rand() < args.uncond_prob:
-            if isinstance(unet.module, LayoutDiffusionUNetModel):
-                if 'obj_class' in unet.module.layout_encoder.used_condition_types:
-                    cond['obj_class'] = torch.ones_like(cond['obj_class']).fill_(unet.module.layout_encoder.num_classes_for_layout_object - 1)
-                    cond['obj_class'][:, 0] = unet.module.layout_encoder.num_classes_for_layout_object - 2
-                if 'obj_name' in unet.module.layout_encoder.used_condition_types:
-                    cond['obj_name'] = torch.stack(batch['default_obj_names'].data[0])
-                if 'obj_bbox' in unet.module.layout_encoder.used_condition_types:
-                    cond['obj_bbox'] = torch.zeros_like(cond['obj_bbox'])
-                    if unet.module.layout_encoder.use_3d_bbox:
-                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 0, 1, 1, 1, 0, 0, 0])
-                    else:
-                        cond['obj_bbox'][:, 0] = torch.FloatTensor([0, 0, 1, 1])
-                cond['is_valid_obj'] = torch.zeros_like(cond['is_valid_obj'])
-                cond['is_valid_obj'][:, 0] = 1.0  
-                 
-        return cond
+    # Build LR Scheduler using utility function
+    scheduler_type = args.lr_scheduler 
 
-    def get_dino_cond(dino_out):
-        if np.random.rand() < args.uncond_prob:
+    # milestones = [
+    #     int(args.max_train_steps * 0.7),  
+    #     int(args.max_train_steps * 0.9), 
+    # ]
+    
+    lr_scheduler = build_scheduler(
+        optimizer=optimizer,
+        scheduler_type=scheduler_type,
+        max_train_steps=args.max_train_steps,  # Original unscaled value
+        num_processes=accelerator.num_processes,  # For distributed training scaling
+        warmup_ratio=0.01,           # 1% warmup
+        warmup_start_factor=0.01,    # Start at 1% of base LR
+        eta_min=1e-6,                # For cosine schedulers
+        milestones=None,             # For multistep: e.g., [50000, 75000]
+        gamma=0.1,                   # For multistep decay factor
+    )
+
+    scheduler_info = get_scheduler_info(
+        scheduler_type=scheduler_type,
+        max_train_steps=args.max_train_steps,
+        warmup_ratio=0.01,
+        eta_min=1e-6,
+    )
+    accelerator.print(f"  LR Scheduler: {scheduler_info}")
+    accelerator.print(f"  UNet LR: {learning_rate * 0.1}, BEV Head LR: {learning_rate}")
+
+
+    with accelerator.main_process_first():
+        train_dataset = CustomNuScenesDiffusionDataset(bev_cfg.data.train)
+        val_dataset = CustomNuScenesDiffusionDataset(bev_cfg.data.val)
+        # train_dataset = NuscDetDataset(bev_cfg.data.train)
+        # val_dataset = NuscDetDataset(bev_cfg.data.val)
+
+    if accelerator.num_processes > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=True,
+            drop_last=True)
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False)
+    else:
+        train_sampler = None
+        val_sampler = None
+        
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+        shuffle=(train_sampler is None),
+        pin_memory=True,
+        persistent_workers=True,
+        collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth,
+                            has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+        # collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, has_depth_any=True),
+        sampler=train_sampler,
+    )    
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        shuffle=False,
+        persistent_workers=True,
+        collate_fn=partial(collate_fn, is_return_depth=bev_cfg.data_return_depth, 
+                           has_depth_any=bev_cfg.use_da3, use_layout_info=bev_cfg.use_layout, use_semantics=bev_cfg.use_semantics),
+        # collate_fn=partial(collate_fn, is_return_depth=bev_cfg.use_fusion, has_depth_any=True),
+        sampler=val_sampler,
+    )
+    
+    def get_dino_cond(rand_prob, dino_out):
+        if rand_prob < args.uncond_prob:
             uncond = {k: v.clone() if isinstance(v, torch.Tensor) else v
                         for k, v in dino_out.items()}
             last_cls_u = torch.zeros_like(dino_out['last_cls'])  # (B,V,C_in)
@@ -280,23 +306,31 @@ def train():
         else:
             cond = dino_out
         return cond
+           
+    def get_segmaps_cond(rand_prob, segmaps):
+        if rand_prob < args.uncond_prob_seg:
+            cond = torch.zeros_like(segmaps)
+        else:
+            cond = segmaps
+        return cond
 
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     
-    unet, optimizer, lr_scheduler = accelerator.prepare(
-        unet, optimizer, lr_scheduler
-    )
-
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
 
     weight_dtype = torch.float32
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     bev_model.to(accelerator.device, dtype=weight_dtype)
+    
+    # Get DINOv2 feature extractor
+    get_dino = GetDINOV2Feat()
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-    
+
     tb_writer = None
     
     # We need to initialize the trackers we use, and also store our configuration.
@@ -332,14 +366,28 @@ def train():
     is_training_sd21 = args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-2-1"
 
     logger.info("***** Running training *****")
+    logger.info(f"  Num accelerator processes = {accelerator.num_processes}")
     logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num dataloader = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Num update steps per epoch = {num_update_steps_per_epoch}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  Is SD21: {is_training_sd21}")
+
+    accelerator.print("***** Running training *****")
+    accelerator.print(f"  Num accelerator processes = {accelerator.num_processes}")
+    accelerator.print(f"  Num examples = {len(train_dataset)}")
+    accelerator.print(f"  Num Epochs = {args.num_train_epochs}")
+    accelerator.print(f"  Num update steps per epoch = {num_update_steps_per_epoch}")
+    accelerator.print(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    accelerator.print(f"  Train datalooader sampler: {train_dataloader.sampler}")
+    accelerator.print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    accelerator.print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    accelerator.print(f"  Total optimization steps = {args.max_train_steps}")
+    accelerator.print(f"  Is SD21: {is_training_sd21}")
+    # accelerator.print(f"  lr_scheduler:: schduler_type={args.lr_scheduler}, num_warmup_steps={args.lr_warmup_steps}, num_training_steps={args.max_train_steps}")
 
     global_step = 0
     first_epoch = 0
@@ -365,8 +413,14 @@ def train():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    device = accelerator.device
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
+        bev_model.head.train()
+
+        if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # For Resume from checkpoint, Skip steps until we reach the resumed step
@@ -376,11 +430,32 @@ def train():
                 continue
 
             with accelerator.accumulate(unet):
+                (sweep_imgs, mats, _, img_metas, gt_boxes, gt_labels, depth_maps, segmaps) = batch
+                
+                # Depth Anything
+                sweep_depth = depth_maps.to(device=device) 
+                segmaps = segmaps.to(device=device)
+       
+                # if len(depth_labels.shape) == 5:
+                #     lidar_depth = depth_labels[:, 0, ...].to(device=device, non_blocking=True)
+                if torch.cuda.is_available():
+                    for key, value in mats.items():
+                        mats[key] = value.to(device=device)
+                    sweep_imgs = sweep_imgs.to(device=device)
+                    gt_boxes = [gt_box.to(device=device) for gt_box in gt_boxes]
+                    gt_labels = [gt_label.to(device=device) for gt_label in gt_labels]
+
+                # DINO   
+                rand_prob = np.random.rand()
+                dino_out = get_dino(sweep_imgs, img_metas)
+                dino_cond = get_dino_cond(rand_prob, dino_out)
+                seg_cond = get_segmaps_cond(rand_prob, segmaps)
+                # layout_cond = get_condition(gt_layout)
+                
                 # Get BEV
                 with torch.no_grad():
-                    latents = bev_model(return_loss=False, only_bev=True, **batch).detach()
-                latents = latents.reshape(-1, bev_cfg.bev_h_, bev_cfg.bev_w_, bev_cfg._dim_)
-                latents = latents.permute(0, 3, 1, 2).contiguous()
+                    latents = bev_model(sweep_imgs, sweep_depth, mats, img_metas, only_bev=True, dino_out=dino_out).detach()
+                latents = latents.contiguous()
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -394,7 +469,6 @@ def train():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # Get the target for loss depending on the prediction type
-
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "sample":
@@ -403,39 +477,16 @@ def train():
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                img = batch['img'].data[0]
-                len_queue = img.size(1)
-                img = img[:, -1, ...]
-                img_metas = [each[len_queue-1] for each in batch['img_metas'].data[0]]
-                dino_out = get_dino(img, img_metas)
-                dino_cond = get_dino_cond(dino_out)
-
-                cond = get_condition(batch)
                 
                 # Predict the noise residual and compute loss
-                # model_pred, multi_feat, _ = unet(noisy_latents, timesteps, dino_cond, **cond)
-                model_pred = unet(noisy_latents, timesteps, dino_cond, **cond)[0]
+                # model_pred = unet(noisy_latents, timesteps, mats, dino_cond, **layout_cond)[0]
+                model_pred = unet(noisy_latents, timesteps, mats, dino_cond, seg_cond, sweep_depth)[0]
 
                 denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                
-                if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
-                    task_loss = get_task_loss(model_pred, **batch)
-                else:
-                    task_loss = 0
+                task_loss = get_task_loss(model_pred, sweep_imgs, sweep_depth, mats, img_metas, gt_boxes, gt_labels)
                     
-                # if args.task_loss_scale > 0 and noise_scheduler.config.prediction_type == "sample":
-                #     # Switch when global_step >= args.task_loss_switch_step.
-                #     if args.task_loss_switch_step is not None and global_step >= args.task_loss_switch_step:
-                #         if multi_feat is not None:
-                #             task_loss = get_task_loss(multi_feat, **batch)
-                #         else:
-                #             task_loss = get_task_loss(model_pred, **batch)
-                # else:
-                #     task_loss = 0
-                    
-                total_loss = denoise_loss + args.task_loss_scale * task_loss
-                
+                total_loss = args.diffusion_loss_scale * denoise_loss + args.task_loss_scale * task_loss
+
                 # get learing rate
                 lr = lr_scheduler.get_last_lr()[0]
 
@@ -446,7 +497,7 @@ def train():
                     "step/epoch": epoch,
                     "lr/learning_rate" : lr,
                     "train/denoise_loss": denoise_loss,
-                    "train/task_loss": task_loss,
+                    # "train/task_loss": task_loss,
                     "train/total_loss": total_loss,
                 }
 
@@ -460,7 +511,8 @@ def train():
                 loss = total_loss 
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                # avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.reduce(loss, reduction="mean")
                                 
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
@@ -468,9 +520,9 @@ def train():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -509,7 +561,8 @@ def train():
                         logger.info(f"Saved state to {save_path}")
                         
                     unet.eval()
-                    if global_step in [30000, 50000]:
+                    bev_model.head.eval()
+                    if global_step in [50000, 100000, 150000, 200000] and args.task_loss_scale > 0:
                         logger.info(f"Evaluating at epoch {epoch} step {global_step}")
                         with torch.no_grad():
                             eval_path = os.path.join(save_path, 'val')
@@ -520,23 +573,21 @@ def train():
                                                     dataset=val_dataset,
                                                     dataloader=val_dataloader,
                                                     bev_cfg=bev_cfg,
-                                                    eval='bbox',
                                                     save_path=eval_path,
+                                                    device=accelerator.device,
                                                     noise_timesteps=5,
                                                     denoise_timesteps=5,
                                                     num_inference_steps=5,
-                                                    use_classifier_guidence=False,
-                                                    inversion=False)
-
-                        if accelerator.is_main_process and args.report_to == "wandb":
+                                                    use_classifier_guidence=False)
+                        
+                        if accelerator.is_main_process and args.report_to == "wandb" and eval_results:
                             for metric, score in eval_results.items():
-                                metric = f"val/{metric}"
-                                wandb.log({metric: score}, step=step_cnt)   
-                        if accelerator.is_main_process and args.report_to == "tensorboard":
+                                wandb.log({f"val/{metric}": score}, step=step_cnt)
+                        if accelerator.is_main_process and args.report_to == "tensorboard" and eval_results:
                             for metric, score in eval_results.items():
-                                metric = f"val/{metric}"
                                 tb_writer.add_scalar(f"val/{metric}", score, global_step=step_cnt)
-                    unet.train()                         
+                    unet.train()      
+                    bev_model.head.train()                   
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch":epoch}
             progress_bar.set_postfix(**logs)
@@ -632,6 +683,13 @@ def parse_args():
         type=float, 
         help="The probability of replacing caption with empty string."
     )
+    
+    parser.add_argument(
+        "--uncond_prob_seg", 
+        default=0.2, 
+        type=float, 
+        help="The probability of replacing caption with empty string."
+    )
 
     parser.add_argument(
         "--output_dir",
@@ -698,6 +756,7 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
 
+
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -715,7 +774,7 @@ def parse_args():
     parser.add_argument(
         "--prediction_type",
         type=str,
-        default=None,
+        default="sample",
         help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'sample' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
     )
 
@@ -782,13 +841,36 @@ def parse_args():
         default=0.0
     )
     
+    
     parser.add_argument(
-        "--task_loss_switch_step",
-        type=int,
-        default=-1,
-        help="If >0, after this many optimization steps use multi_feat for task loss (if available). Default 0 -> always use model_pred."
+        "--depth_save_dir",
+        type=str,
+        default=None
     )
     
+    parser.add_argument(
+        "--depth_dir",
+        type=str,
+        default=None
+    )
+
+    parser.add_argument(
+        "--semantic_dir",
+        type=str,
+        default=None
+    )
+
+    parser.add_argument(
+        "--diffusion_loss_scale", 
+        type=float, 
+        default=0.0
+    )
+    
+    parser.add_argument(
+        "--training_phase",
+        type=str,
+        default=None
+    )
 
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:

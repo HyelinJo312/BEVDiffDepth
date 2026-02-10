@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from bevdepth.datasets.nusc_det_dataset import NuscDetDataset, collate_fn
-from bevdepth.projects.fm_feature import GetDINOV2Feat
+from bevdepth.projects.fm_feature import GetDINOV2Feat, GetDINOv2Cond
 
 # =======================================================================
 # 0. Config 
@@ -84,10 +84,10 @@ CLASSES = [
 # =======================================================================
 
 C_IN = 768          
-C_REDUCED = 256    
+C_REDUCED = 80    
 MAX_SAMPLES = 3_000_000   
 
-DATA_ROOT = 'data/nuScenes'  # nuScenes root
+DATA_ROOT = '../../data/nuScenes'  # nuScenes root
 TRAIN_INFO_PATH = os.path.join(DATA_ROOT, 'nuscenes_infos_train.pkl')
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -159,12 +159,15 @@ def feature_extractor(batch) -> torch.Tensor:
     img_metas = batch[3]
     dino_outputs = dino_model(imgs, img_metas)
     
-    img_feats = dino_outputs['last_tokens'] # [B, V, N, C] N=35x58
+    img_feats = dino_outputs['last_tokens'] # [B, V, N, C] N=35x58  # (B,N,V,C,Hp,Wp)
+    B, V, S, C, Hp, Wp = img_feats.shape
+    img_feats = img_feats[:,:,0,:,:,:].reshape(B, V, C, Hp*Wp).permute(0,1,3,2).contiguous()  # (B, V, N, C)
+
     # patch_hw = dino_outputs['patch_hw'] # (H2/14, W2/14)  (35, 58)
     
     # img_feats = img_feats.reshape(-1, img_feats.shape[1], img_feats.shape[-1], patch_hw[0], patch_hw[1])  # [B*N, V, C, H2/14, W2/14]
     assert img_feats.shape[-1] == C_IN, f"Expected last dim = {C_IN}, got {img_feats.shape[-1]}"
-    return img_feats  # (B, V, N, C) 
+    return img_feats  # (B, V, N, C)  # (B,N,V,C,Hp,Wp)
 
 
 # =======================================================================
@@ -181,7 +184,7 @@ def collect_feature_samples(
     N_collected = 0
 
     for batch_idx, batch in enumerate(dataloader):
-        feats = feature_extractor(batch)  # (B, V, N, C_IN)
+        feats = feature_extractor(batch)  # (B, V, N, C_IN) 
         # (B, V, N, C) -> (B*V*N, C)
         feats = feats.reshape(-1, C_IN)               # (N_batch, C_IN)
 
@@ -255,7 +258,7 @@ def fit_and_save_pca(
 # =======================================================================
 
 def main():
-    mmcv.mkdir_or_exist("./outputs")
+    # mmcv.mkdir_or_exist("./outputs")
 
     # 1) dataloader 
     train_loader = build_train_dataloader(
@@ -284,7 +287,7 @@ def main():
     pca_path = fit_and_save_pca(
         feature_bank=feature_bank,
         n_components=C_REDUCED,
-        out_dir="./pca_ckpts",
+        out_dir="../../pca_ckpts",
         tag="sckit",
     )
 

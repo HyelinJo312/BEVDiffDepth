@@ -8,7 +8,7 @@ from bevdepth.callbacks.ema import EMACallback
 from bevdepth.utils.torch_dist import all_gather_object, synchronize
 
 from .nuscenes.base_exp import BEVDepthLightningModel
-from .nuscenes.dino_exp import BEVDepthLightningModel
+# from .nuscenes.dino_exp import BEVDepthLightningModel
 
 
 def run_cli(model_class=BEVDepthLightningModel,

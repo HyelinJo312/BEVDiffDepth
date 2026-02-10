@@ -16,7 +16,8 @@ from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
 import pytorch_lightning as pl
 from argparse import ArgumentParser
-from bevdepth.exps.nuscenes.dino_exp import BEVDepthLightningModel  # 네가 보여준 클래스
+from bevdepth.exps.nuscenes.dino_exp import BEVDepthLightningModel  
+from argparse import ArgumentParser
 
 
 def get_bev_model(args):
@@ -125,49 +126,125 @@ def instantiate_from_config(cfg):
 
 
 
-def get_bevdepth_model(args, return_lightning=False):
+# def get_bevdepth_model(cfg, args, return_lightning=False):
+#     """
+#     BEVDepthLightningModel 을 checkpoint 없이 생성하여
+#     BEVFormer teacher처럼 사용할 수 있게 NN module만 반환하는 함수.
+
+#     args expected fields:
+#     - args.device        (optional, default 'cuda:0')
+#     - args.freeze        (optional, default True)
+#     - args.extra_hparams (optional, dict override)
+#     """
+
+#     # ----------------------------
+#     # 1) args value gathering
+#     # ----------------------------
+#     freeze = getattr(args, "freeze", True)
+#     extra_hparams = getattr(args, "extra_hparams", None)
+
+#     # ----------------------------
+#     # 2) Lightning hparams 생성
+#     # ----------------------------
+#     parent_parser = ArgumentParser(add_help=False)
+#     parent_parser = pl.Trainer.add_argparse_args(parent_parser)
+#     parent_parser.add_argument("--seed", type=int, default=0)
+
+#     parser = BEVDepthLightningModel.add_model_specific_args(parent_parser)
+
+#     parser.set_defaults(
+#         profiler='simple',
+#         deterministic=False,
+#         max_epochs=24,
+#         accelerator='ddp',
+#         num_sanity_val_steps=0,
+#         gradient_clip_val=5,
+#         limit_val_batches=0,
+#         enable_checkpointing=False,  # checkpoint 안 쓰므로 disable 가능
+#         precision=16,
+#         default_root_dir='./outputs/bev_depth_uninitialized'
+#     )
+
+#     # CLI가 아니므로 default hparams 가져오기
+#     hparams = parser.parse_args([])
+
+#     if extra_hparams is not None:
+#         for k, v in extra_hparams.items():
+#             setattr(hparams, k, v)
+
+#     if getattr(hparams, "seed", None) is not None:
+#         pl.seed_everything(hparams.seed)
+
+#     # ----------------------------
+#     # 3) LightningModule 생성 (checkpoint load X)
+#     # ----------------------------
+#     lit_model = BEVDepthLightningModel(**vars(hparams))
+#     lit_model.eval()
+
+#     # ----------------------------
+#     # 4) 반환 형태 결정
+#     # ----------------------------
+#     if return_lightning:
+#         return lit_model  # dataloader 포함된 LightningModule 자체 반환
+
+#     # 실제 backbone module (DINOBEVDepth)
+#     model = lit_model.model
+#     model.eval()
+
+#     return model
+
+
+
+
+def get_bevdepth_model(cfg, args, return_lightning=False):
     """
-    BEVDepthLightningModel 을 checkpoint 없이 생성하여
-    BEVFormer teacher처럼 사용할 수 있게 NN module만 반환하는 함수.
+    Args:
+        cfg: mmcv Config 객체. backbone_conf, head_conf 등 모델 설정 포함.
+        args: argparse Namespace. bev_checkpoint, training_phase 등 포함.
+        return_lightning: True이면 LightningModule 반환, False이면 내부 모델만 반환.
 
-    args expected fields:
-    - args.device        (optional, default 'cuda:0')
-    - args.freeze        (optional, default True)
-    - args.extra_hparams (optional, dict override)
+    Returns:
+        training_phase == 'pretraining': backbone만 포함된 모델 (head → nn.Identity())
+        training_phase == 'finetuning' 또는 None: backbone + head 전체 모델
     """
 
-    # ----------------------------
-    # 1) args value gathering
-    # ----------------------------
-    device = getattr(args, "device", "cuda:0")
-    freeze = getattr(args, "freeze", True)
-    extra_hparams = getattr(args, "extra_hparams", None)
+    training_phase = getattr(args, "training_phase", None)
 
-    # ----------------------------
-    # 2) Lightning hparams 생성
-    # ----------------------------
+    # --- Lightning hparams 생성 ---
     parent_parser = ArgumentParser(add_help=False)
     parent_parser = pl.Trainer.add_argparse_args(parent_parser)
     parent_parser.add_argument("--seed", type=int, default=0)
-
+    
     parser = BEVDepthLightningModel.add_model_specific_args(parent_parser)
 
     parser.set_defaults(
-        profiler='simple',
+        profiler="simple",
         deterministic=False,
         max_epochs=24,
-        accelerator='ddp',
+        accelerator="ddp",
         num_sanity_val_steps=0,
         gradient_clip_val=5,
         limit_val_batches=0,
-        enable_checkpointing=False,  # checkpoint 안 쓰므로 disable 가능
+        enable_checkpointing=False,
         precision=16,
-        default_root_dir='./outputs/bev_depth_uninitialized'
+        default_root_dir="./outputs/bev_depth_uninitialized",
     )
-
-    # CLI가 아니므로 default hparams 가져오기
     hparams = parser.parse_args([])
 
+    # cfg에서 모델 관련 설정을 hparams로 override
+    _CFG_TO_HPARAM = {
+        "CLASSES": "class_names",
+        "backbone_conf": "backbone_conf",
+        "head_conf": "head_conf",
+        "ida_aug_conf": "ida_aug_conf",
+        "bda_aug_conf": "bda_aug_conf",
+    }
+    for cfg_key, hparam_key in _CFG_TO_HPARAM.items():
+        val = cfg.get(cfg_key, None) if hasattr(cfg, 'get') else getattr(cfg, cfg_key, None)
+        if val is not None:
+            setattr(hparams, hparam_key, val)
+
+    extra_hparams = getattr(args, "extra_hparams", None)
     if extra_hparams is not None:
         for k, v in extra_hparams.items():
             setattr(hparams, k, v)
@@ -175,28 +252,23 @@ def get_bevdepth_model(args, return_lightning=False):
     if getattr(hparams, "seed", None) is not None:
         pl.seed_everything(hparams.seed)
 
-    # ----------------------------
-    # 3) LightningModule 생성 (checkpoint load X)
-    # ----------------------------
+    # --- 모델 생성 및 checkpoint 로드 ---
     lit_model = BEVDepthLightningModel(**vars(hparams))
-    lit_model.eval()
-    lit_model.to(device)
 
-    if freeze:
-        lit_model.freeze()
+    bev_ckpt = getattr(args, "bev_checkpoint", None)
+    if bev_ckpt is not None and os.path.exists(bev_ckpt):
+        load_checkpoint(lit_model.model, bev_ckpt, map_location='cpu')
+        print(f"[get_bevdepth_model] Loaded BEV checkpoint: {bev_ckpt}")
 
-    # ----------------------------
-    # 4) 반환 형태 결정
-    # ----------------------------
-    if return_lightning:
-        return lit_model  # dataloader 포함된 LightningModule 자체 반환
-
-    # 실제 backbone module (DINOBEVDepth)
     model = lit_model.model
-    model.to(device)
     model.eval()
 
-    if freeze:
-        model.requires_grad_(False)
+    # pretraining 단계에서는 head가 불필요하므로 제거하여 메모리 절약
+    if training_phase == 'pretraining':
+        model.head = torch.nn.Identity()
+        print("[get_bevdepth_model] training_phase='pretraining': replacing head with nn.Identity()")
+
+    if return_lightning:
+        return lit_model
 
     return model

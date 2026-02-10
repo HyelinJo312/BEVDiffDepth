@@ -198,8 +198,10 @@ class CenterPointBBoxCoder(BaseBBoxCoder):
             thresh_mask = final_scores > self.score_threshold
 
         if self.post_center_range is not None:
-            self.post_center_range = torch.tensor(
-                self.post_center_range, device=heat.device)
+            # self.post_center_range = torch.tensor(
+            #     self.post_center_range, device=heat.device)
+            self.post_center_range = torch.as_tensor(self.post_center_range, device=heat.device, dtype=torch.float32)
+            self.post_center_range.to(device=heat.device)
             mask = (final_box_preds[..., :3] >=
                     self.post_center_range[:3]).all(2)
             mask &= (final_box_preds[..., :3] <=

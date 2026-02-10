@@ -60,7 +60,6 @@ class DINOBEVDepth(nn.Module):
         """
         if only_bev:
             bev_feature = self.backbone(x, lidar_depth, mats_dict, img_metas, timestamps, only_bev=True, dino_out=dino_out)
-            # preds = self.head(bev_feature)
             return bev_feature
         else:
             # bev_feature = self.backbone(x, lidar_depth,
@@ -71,8 +70,7 @@ class DINOBEVDepth(nn.Module):
             if given_bev is not None:
                 preds = self.head(given_bev)
             else:
-                bev_feature = self.backbone(x, lidar_depth, mats_dict, img_metas, timestamps, 
-                                            dino_out=dino_out)
+                bev_feature = self.backbone(x, lidar_depth, mats_dict, img_metas, timestamps,dino_out=dino_out)
                 preds = self.head(bev_feature)
             return preds
 

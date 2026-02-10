@@ -8,6 +8,7 @@ import numpy as np
 import pyquaternion
 from nuscenes.utils.data_classes import Box
 from pyquaternion import Quaternion
+from nuscenes import NuScenes
 
 __all__ = ['DetNuscEvaluator']
 
@@ -206,15 +207,32 @@ class DetNuscEvaluator():
         result_files, tmp_dir = self.format_results(results, img_metas,
                                                     result_names,
                                                     jsonfile_prefix)
+        eval_results = {}
+        # if isinstance(result_files, dict):
+        #     for name in result_names:
+        #         print('Evaluating bboxes of {}'.format(name))
+        #         self._evaluate_single(result_files[name])
+        # elif isinstance(result_files, str):
+        #     self._evaluate_single(result_files)
+
+        # if tmp_dir is not None:
+        #     tmp_dir.cleanup()
         if isinstance(result_files, dict):
             for name in result_names:
-                print('Evaluating bboxes of {}'.format(name))
-                self._evaluate_single(result_files[name])
-        elif isinstance(result_files, str):
-            self._evaluate_single(result_files)
+                print(f'Evaluating bboxes of {name}')
+                print("============================================================")
+                detail = self._evaluate_single(result_files[name], logger=logger, metric=metric, result_name=name)
+                if isinstance(detail, dict):
+                    eval_results.update(detail)
+        else:
+            detail = self._evaluate_single(result_files, logger=logger, metric=metric, result_name=result_names[0])
+            if isinstance(detail, dict):
+                eval_results.update(detail)
 
         if tmp_dir is not None:
             tmp_dir.cleanup()
+
+        return eval_results
 
     def _format_bbox(self, results, img_metas, jsonfile_prefix=None):
         """Convert the results to the standard format.
@@ -230,7 +248,7 @@ class DetNuscEvaluator():
         """
         nusc_annos = {}
         mapped_class_names = self.class_names
-
+        nusc = NuScenes(version=self.version, dataroot=self.data_root, verbose=False)
         print('Start to convert detection format...')
 
         for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
@@ -239,6 +257,13 @@ class DetNuscEvaluator():
             sample_token = img_metas[sample_id]['token']
             trans = np.array(img_metas[sample_id]['ego2global_translation'])
             rot = Quaternion(img_metas[sample_id]['ego2global_rotation'])
+            
+            # sample = nusc.get('sample', sample_token)
+            # sample_data = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+            # ego_pose = nusc.get('ego_pose', sample_data['ego_pose_token'])
+            # trans = np.array(ego_pose['translation'])
+            # rot = Quaternion(ego_pose['rotation'])
+            
             annos = list()
             for i, box in enumerate(boxes):
                 name = mapped_class_names[labels[i]]

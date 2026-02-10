@@ -6,6 +6,12 @@
 # Copyright (c) 2023 LayoutDiffusion authors, licensed under the MIT license,
 # cf. 3rd-party-licenses.txt file in the root directory of this source tree.
 
+'''
+
+Diffusion Input = BEV + DINO-BEV
+
+'''
+
 from abc import abstractmethod
 import os
 import safetensors

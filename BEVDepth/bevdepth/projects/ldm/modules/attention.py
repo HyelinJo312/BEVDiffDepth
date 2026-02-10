@@ -249,6 +249,7 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
+        assert x.shape[2]*x.shape[3] == context.shape[1], f'BEV feature: {x.shape}, DINO condition: {context.shape[1]}'
         b, c, h, w = x.shape
         x_in = x
         x = self.norm(x)

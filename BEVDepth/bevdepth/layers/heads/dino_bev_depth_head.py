@@ -14,20 +14,22 @@ __all__ = ['BEVDepthHead']
 
 bev_backbone_conf = dict(
     type='ResNet',
-    in_channels=256,
+    in_channels=160,
     depth=18,
     num_stages=3,
     strides=(1, 2, 2),
     dilations=(1, 1, 1),
     out_indices=[0, 1, 2],
     norm_eval=False,
-    base_channels=256,
+    base_channels=160, # 256
 )
 
 bev_neck_conf = dict(type='SECONDFPN',
-                     in_channels=[256, 512, 1024],
-                     upsample_strides=[2, 4, 8],
-                     out_channels=[64, 64, 128])
+                # in_channels=[256, 256, 512, 1024],
+                in_channels=[160, 160, 320, 640],
+                upsample_strides=[1, 2, 4, 8],
+                out_channels=[64, 64, 64, 64])
+
 
 
 @numba.jit(nopython=True)
@@ -189,7 +191,12 @@ class BEVDepthHead(CenterHead):
         pc_range = torch.tensor(self.train_cfg['point_cloud_range'])
         voxel_size = torch.tensor(self.train_cfg['voxel_size'])
 
-        feature_map_size = grid_size[:2] // self.train_cfg['out_size_factor']
+        # feature_map_size = grid_size[:2] // self.train_cfg['out_size_factor']
+        feature_map_size = torch.div(
+                                grid_size[:2],
+                                self.train_cfg['out_size_factor'],
+                                rounding_mode='floor'
+                            )
 
         # reorganize the gt_dict by tasks
         task_masks = []
@@ -364,8 +371,8 @@ class BEVDepthHead(CenterHead):
             pred = pred.view(pred.size(0), -1, pred.size(3))
             pred = self._gather_feat(pred, ind)
             mask = masks[task_id].unsqueeze(2).expand_as(target_box).float()
-            num = torch.clamp(reduce_mean(target_box.new_tensor(num)),
-                              min=1e-4).item()
+            num_t = torch.as_tensor(num, device=target_box.device, dtype=target_box.dtype)
+            num = torch.clamp(reduce_mean(num_t), min=1e-4).item()
             isnotnan = (~torch.isnan(target_box)).float()
             mask *= isnotnan
             code_weights = self.train_cfg['code_weights']
